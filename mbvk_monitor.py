@@ -27,108 +27,139 @@ def scrape_with_browser():
     arveresek = []
     
     with sync_playwright() as p:
-        print("Böngésző indítása...")
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        print("Böngésző indítása sandbox nélkül...")
+        # Aargs hozzáadása a GitHub Actions kompatibilitás miatt
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
         
-        # Megnyitjuk az MBVK-t
-        page.goto("https://arveres.mbvk.hu/", wait_until="networkidle")
+        # Beállítunk egy fix ablakméretet, hogy minden gomb látható legyen
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
+        page = context.new_page()
         
-        print("Szűrők beállítása a felületen...")
-        # Kiválasztjuk az Ingatlan kategóriát (az elküldött HTML alapján a szelektorok)
+        print("MBVK oldal betöltése...")
+        page.goto("https://arveres.mbvk.hu/", wait_until="networkidle", timeout=60000)
+        
         try:
-            # Megvárjuk, amíg a szűrőpanel vagy a gombok betöltenek
-            page.wait_for_selector("input, select, button")
+            # 1. Sütik elfogadása (ha felugrik a panel, rákattintunk a 'Mindet elfogadom' gombra)
+            cookie_btn = page.locator("button#s-all-bn, button:has-text('elfogadom'), button:has-text('Accept')")
+            if cookie_btn.count() > 0:
+                cookie_btn.first.click()
+                print("Sütik elfogadva.")
+                page.wait_for_timeout(1000)
+
+            # 2. Szűrők beállítása
+            print("Szűrési feltételek beállítása...")
             
-            # TODO / TESZT: Először szűrés nélkül kérjük le a hirdetményeket, 
-            # hogy lássuk, egyáltalán bejönnek-e az adatok a táblázatba!
-            # Megnyomjuk a kereső gombot (ha van fix gomb, azonosítjuk az osztálya vagy szövege alapján)
-            # Az elküldött HTML-ben a kereső gombra kattintunk:
+            # Kategória -> INGATLAN
+            # Megkeressük a legördülő menüt vagy gombot a kategóriához
+            page.locator("select[name='kategoria'], select:has-text('Ingatlan')").select_option(label="Ingatlan")
+            
+            # Árverés állapota -> AKTÍV
+            page.locator("select[name='arveres_allapota']").select_option(value="AKTIV")
+            
+            # Tulajdoni hányad -> 1/1
+            page.locator("select[name='tulajdoni_hanyad']").select_option(value="1/1")
+            
+            # Tehermentes -> IGEN
+            page.locator("select[name='tehermentes']").select_option(value="IGEN")
+            
+            # Beköltözhető -> IGEN
+            page.locator("select[name='bekoltozheto']").select_option(value="IGEN")
+            
+            print("Keresés indítása...")
+            # Megnyomjuk a kereső gombot
             search_button = page.locator("button:has-text('Keresés'), input[type='submit']")
-            if search_button.count() > 0:
-                search_button.first.click()
-                page.wait_for_timeout(3000) # Várunk 3 másodpercet a találatokra
+            search_button.first.click()
             
-            # Kivesszük a teljes betöltött HTML-t
+            # Megvárjuk, amíg a hálózati forgalom elcsendesedik és betölt a táblázat
+            page.wait_for_timeout(5000)
+            
+            # Kivesszük a lerendelt oldal HTML tartalmát
             html_content = page.content()
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Megkeressük az összes hirdetmény kártyát vagy táblázat sort
-            # Az Angularos MBVK-n ezek általában div-ek vagy 'tr' elemek
-            for row in soup.find_all(['tr', 'div'], class_=lambda x: x and ('adat-sor' in x or 'arveres' in x or 'card' in x)):
-                text = row.get_text()
-                if "Ft" in text or "HUF" in text:
-                    # Megpróbálunk linket találni hozzá
+            # Megkeressük a táblázat sorait (tr) vagy kártyákat
+            rows = soup.find_all('tr')
+            print(f"Vizsgált HTML sorok száma: {len(rows)}")
+            
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 4:
+                    text_content = row.get_text()
+                    
+                    # Ha a sor tartalmaz linket az árverésre
                     link_tag = row.find('a', href=True)
-                    link = "https://arveres.mbvk.hu" + link_tag['href'] if link_tag else "https://arveres.mbvk.hu"
-                    
-                    # Kiszedjük az ügyszámot vagy egyedi azonosítót (ha van benne szám)
-                    prop_id = ''.join(filter(str.isdigit, link)) if link_tag else str(hash(text))
-                    
-                    # Ár kinyerése
-                    kikialtasi_ar = 0
-                    for word in text.split():
-                        if any(c.isdigit() for c in word) and ("000" in word or len(word) >= 6):
-                            try:
-                                szam = int(''.join(filter(str.isdigit, word)))
-                                if szam > 100000:
-                                    kikialtasi_ar = szam
-                                    break
-                            except: pass
-
-                    arveresek.append({
-                        "id": prop_id,
-                        "telepules": text[:50].replace("\n", " "),
-                        "ar": kikialtasi_ar,
-                        "link": link
-                    })
-                    
-            # Ha a fenti nem talált semmit, de vannak linkek az oldalon, mentsük el azokat
-            if not arveresek:
-                for a_tag in soup.find_all('a', href=True):
-                    if "hirdetmeny" in a_tag['href'] or "adat" in a_tag['href']:
-                        arveresek.append({
-                            "id": ''.join(filter(str.isdigit, a_tag['href'])),
-                            "telepules": a_tag.get_text(strip=True),
-                            "ar": 0,
-                            "link": "https://arveres.mbvk.hu" + a_tag['href']
-                        })
+                    if link_tag and ("hirdetmeny" in link_tag['href'] or "arveres" in link_tag['href']):
+                        link = "https://arveres.mbvk.hu" + link_tag['href']
                         
+                        # Ügyszám / ID kiszedése a linkből vagy az első oszlopból
+                        prop_id = ''.join(filter(str.isdigit, link_tag['href']))
+                        if not prop_id:
+                            prop_id = cells[0].get_text(strip=True)
+                            
+                        telepules = cells[1].get_text(strip=True)
+                        
+                        # Ár kiszedése (megkeressük azt a cellát, amiben a 'Ft' vagy 'HUF' van)
+                        kikialtasi_ar = 0
+                        for cell in cells:
+                            cell_text = cell.get_text(strip=True)
+                            if "Ft" in cell_text or "HUF" in cell_text:
+                                try:
+                                    kikialtasi_ar = int(''.join(filter(str.isdigit, cell_text)))
+                                    break
+                                except: pass
+                        
+                        if prop_id:
+                            arveresek.append({
+                                "id": prop_id,
+                                "telepules": telepules,
+                                "ar": kikialtasi_ar,
+                                "link": link
+                            })
+                            
         except Exception as e:
-            print(f"Hiba a böngésző szimuláció közben: {e}")
+            print(f"Hiba a szűrés vagy adatkinyerés közben: {e}")
             
         browser.close()
+        
     return arveresek
 
 def main():
     old_records = load_database()
     properties = scrape_with_browser()
     
-    print(f"Összesen talált hirdetés a listában: {len(properties)}")
+    print(f"Összesen talált szűrt hirdetés: {len(properties)}")
     new_found = False
     
     for prop in properties:
         prop_id = prop["id"]
-        if not prop_id: continue
+        kikialtasi_ar = prop["ar"]
         
-        # Első körben minden 20 millió alatti (vagy ismeretlen áru) elemet átengedünk tesztnek!
-        if prop["ar"] <= 20000000:
+        # SZIGORÚ SZŰRÉS: Max 2 000 000 HUF kikiáltási ár
+        # (Ha valamiért 0 maradt az ár a kaparás miatt, átengedjük, hogy manuálisan ellenőrizhesd)
+        if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
             if prop_id not in old_records:
                 new_found = True
                 old_records.append(prop_id)
                 
+                ar_kiiras = f"{kikialtasi_ar:,} HUF" if kikialtasi_ar > 0 else "Ellenőrizendő az adatlapon"
+                
                 üzenet = (
-                    f"🚨 *MBVK TESZT TALÁLAT!*\n\n"
-                    f"ℹ️ *Infó:* {prop['telepules']}\n"
-                    f"💰 *Becsült ár:* {prop['ar']:,} HUF\n\n"
-                    f"🔗 [Adatlap megnyitása]({prop['link']})"
+                    f"🚨 *ÚJ MBVK INGATLAN TALÁLAT!*\n\n"
+                    f"📍 *Település:* {prop['telepules']}\n"
+                    f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
+                    f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
+                    f"🔗 [Ugrás az MBVK adatlapra]({prop['link']})"
                 )
                 send_telegram_message(üzenet)
                 
     if new_found:
         save_database(old_records)
+        print("Az új találatok sikeresen kiküldve és elmentve.")
     else:
-        print("Nem találtam új hirdetést.")
+        print("Nem találtam a feltételeknek megfelelő új ingatlant.")
 
 if __name__ == "__main__":
     main()
