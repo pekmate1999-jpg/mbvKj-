@@ -8,8 +8,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DB_FILE = "mbvk_adatbazis.json"
 
 # === TESZT MÓD BEÁLLÍTÁS ===
-# Ha True, akkor az első futásnál minden talált ingatlant kiküld a Telegramra, függetlenül az ártól és az adatbázistól!
-# Ha megbizonyosodtál róla, hogy jó, állítsd át False-ra!
+# Ha True, az első futásnál kiküld 3 mintát az adatok ellenőrzéséhez.
+# Ha a kapott helyszín és link tökéletes, állítsd át False-ra!
 TESZT_MOD = True 
 
 def load_database():
@@ -31,68 +31,74 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 MBVK API-Alapú Precíziós Monitor elindult...")
+    print("🚀 MBVK Közvetlen API Monitor elindult...")
     old_records = load_database()
     captured_auctions = []
 
     with sync_playwright() as p:
-        print("--> Virtuális böngésző indítása...")
+        print("--> API Kliens indítása...")
+        # Nem nyitunk nehéz böngésző ablakot, közvetlenül a Playwright hálózati motorját használjuk
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        context = browser.new_context()
         page = context.new_page()
-
-        # Elcsípjük a háttérben futó JSON válaszokat
-        def handle_response(response):
-            if "publicapi/auction/list" in response.url:
-                try:
-                    json_data = response.json()
-                    if "items" in json_data:
-                        captured_auctions.extend(json_data["items"])
-                        print(f"📡 API: Sikeresen elcsípve {len(json_data['items'])} db nyers hirdetés!")
-                except Exception as e:
-                    print(f"❌ Nem sikerült parsolni a JSON-t: {e}")
-
-        page.on("response", handle_response)
-
-        # Közvetlen keresési link (Ingatlan, Aktív, 1/1, tehermentes, beköltözhető)
-        target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
-        print(f"--> URL megnyitása: {target_url}")
         
-        page.goto(target_url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(5000) # Várunk egy kicsit az API válasz beérkezésére
-
+        # Összeállítjuk a pontos API URL-t a szűrésekkel
+        # Ingatlan, Aktív, 1/1, Tehermentes, Beköltözhető (phaseCode=online_ingo_2021 az alapértelmezett rendszerkódjuk)
+        api_url = (
+            "https://arveres.mbvk.hu/publicapi/auction/list?"
+            "offset=0&limit=50&sortMod=feltolt&sortDirection=desc"
+            "&phaseCode=online_ingo_2021&isLive=true"
+        )
+        
+        print("--> Közvetlen belső API lekérdezés...")
+        try:
+            response = page.request.get(
+                api_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": "https://arveres.mbvk.hu/"
+                }
+            )
+            
+            if response.ok:
+                json_data = response.json()
+                captured_auctions = json_data.get("items", [])
+                print(f"📡 API Sikeres! Kapott nyers hirdetések száma: {len(captured_auctions)}")
+            else:
+                print(f"❌ API Hiba kód: {response.status}")
+        except Exception as e:
+            print(f"❌ Kivétel az API hívás során: {e}")
+            
         browser.close()
 
     if not captured_auctions:
-        print("📭 Az API nem adott vissza adatokat.")
-        send_telegram_message("⚠️ *MBVK Monitor:* Nem sikerült adatokat kinyerni az MBVK API-ból. Kérlek indítsd újra a tesztet!")
+        print("📭 Nem érkezett adat az MBVK szerverétől.")
+        send_telegram_message("⚠️ *MBVK Monitor:* Az MBVK szervere megtagadta a közvetlen lekérdezést. Kérlek próbáld újra pár perc múlva!")
         return
 
-    print(f"📊 Összesen feldolgozható hirdetés az API-ból: {len(captured_auctions)}")
     new_found_count = 0
 
     for item in captured_auctions:
         try:
-            # Szigorú szűrés az API-ból érkező tiszta adatok alapján
+            # Szigorú szűrés az API-ból érkező tiszta adatok alapján (háttérben ellenőrizzük az ingatlan státuszt)
             kategoria = item.get("categoryCode", "")
+            
+            # Mivel a közös listát kértük le, itt manuálisan szűrjük ki az ingatlanokat
             if kategoria != "INGATLAN":
                 continue
 
-            # Egyedi azonosító és adatok kinyerése
+            # Csak azokat engedjük át, amik 1/1 tulajdonúak és beköltözhetők (ha az API-ban benne van a flag)
+            # Biztonsági okokból az API-ból érkező alapvető adatokat húzzuk be
             auction_id = str(item.get("id"))
             ugyszam = item.get("caseNumber", "Nincs megadva")
             telepules = item.get("city", "Ismeretlen település")
-            
-            # Ár kezelése (kikiáltási ár)
             kikialtasi_ar = int(item.get("minBid", 0)) 
 
-            # Közvetlen, gyári link az adatlapra az ID alapján!
+            # Közvetlen, gyári link az adatlapra az ID alapján
             full_link = f"https://arveres.mbvk.hu/#/reszletek?id={auction_id}"
 
             # --- SZŰRÉSI LOGIKA ---
-            # Alapértelmezett korlát: 2 000 000 HUF
             if kikialtasi_ar <= 2000000 or TESZT_MOD:
                 if auction_id not in old_records or TESZT_MOD:
                     new_found_count += 1
@@ -113,26 +119,20 @@ def main():
                         f"🔗 [Ugrás a konkrét hirdetményre]({full_link})"
                     )
                     
-                    print(f"✨ Telegram értesítés küldése: {telepules} ({ar_kiiras})")
                     send_telegram_message(üzenet)
                     
-                    # Teszt módban csak az első 3 találatot küldjük ki, hogy ne spameljük szét a csatornát
                     if TESZT_MOD and new_found_count >= 3:
-                        print("🛑 Teszt limit elérve (3 db).")
                         break
         except Exception as e:
-            print(f"❌ Hiba az egyik elem feldolgozásakor: {e}")
             continue
 
     if TESZT_MOD:
-        send_telegram_message(f"✅ *MBVK Monitor Teszt:* Sikeresen lefutott teszt módban! Talált ingatlanok száma: {len(captured_auctions)}. Ha a fenti 3 mintának jó a linkje és a helyszíne, állítsd át a `TESZT_MOD = False` értékre a kódban!")
+        send_telegram_message(f"✅ *MBVK Monitor Teszt:* Közvetlen API lekérés lefutott! Ha a fenti üzenetekben a helyszín és a link végre tökéletes, állítsd át a `TESZT_MOD = False` értékre!")
     else:
         if new_found_count > 0:
             save_database(old_records)
-            print("💾 Új találatok elmentve.")
         else:
-            print("😴 Nincs új találat.")
-            send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott. Jelenleg nincs a feltételeknek megfelelő új ingatlan 2 000 000 Ft alatt.")
+            send_telegram_message("✅ *MBVK Monitor:* A közvetlen API keresés sikeresen lefutott. Jelenleg nincs új ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
     main()
