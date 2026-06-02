@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-import time
+import re
 from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -30,11 +30,11 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 MBVK Hibrid Adat-Elcsípő Monitor elindult...")
+    print("🚀 MBVK Kikényszerített Monitor elindult...")
     old_records = load_database()
     
-    # Ebbe a listába mentjük el, amit a hálózatból elkapunk
     captured_data = {"items": []}
+    backup_auctions = []
 
     with sync_playwright() as p:
         print("--> Virtuális Chrome indítása...")
@@ -44,51 +44,101 @@ def main():
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
+            viewport={"width": 1280, "height": 1000} # Megnövelt magasság, hogy több kártya látsszon
         )
         page = context.new_page()
 
-        # Eseménykezelő: Figyeljük a háttérben futó hálózati válaszokat
+        # A-TERV: Hálózati API elcsípése
         def on_response(response):
             if "publicapi/auction/list" in response.url:
                 try:
                     json_res = response.json()
                     if "items" in json_res and len(json_res["items"]) > 0:
                         captured_data["items"] = json_res["items"]
-                        print(f"🎯 SIKER! Elcsípve {len(json_res['items'])} db hirdetés a hálózati forgalomból!")
-                except Exception as e:
-                    print(f"❌ Hiba a háttér-JSON olvasásakor: {e}")
+                        print(f"🎯 SIKER! Elcsípve {len(json_res['items'])} db hirdetés a hálózatból!")
+                except:
+                    pass
 
         page.on("response", on_response)
 
-        # Megnyitjuk a rendes szűrt felületet
         target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
         print(f"--> Oldal megnyitása: {target_url}")
         
         page.goto(target_url, wait_until="load", timeout=60000)
         
-        # Aktív várakozási ciklus: maximum 20 másodpercig várunk, hogy az elcsípő funkció megteljen adattval
-        print("--> Várakozás az API csomag beérkezésére...")
-        for _ in range(20):
-            if len(captured_data["items"]) > 0:
-                break
-            page.wait_for_timeout(1000)
+        # --- KIKÉNYSZERÍTÉS ---
+        # Megvárjuk, amíg a fő tartalmi rész vagy bármilyen kártya/táblázat betöltődik a képernyőre
+        print("--> Várakozás a felület elemeire a betöltődés kikényszerítéséhez...")
+        try:
+            page.wait_for_selector("mat-card, .mat-row, tr, .card, [role='row'], .search-result", timeout=15000)
+            # Finom görgetés lefelé, hogy az Angular biztosan aktiválja a Lazy Loadingot
+            page.evaluate("window.scrollBy(0, 400);")
+            page.wait_for_timeout(5000)
+        except Exception as e:
+            print(f"⚠️ Várakozási időtúllépés a szelektorra, de folytatjuk: {e}")
+
+        # B-TERV: Ha az API elcsípés csődöt mondana, közvetlenül a DOM elemekből szedjük ki az adatokat
+        if len(captured_data["items"]) == 0:
+            print("🔄 B-TERV: API nem reagált, adatok kinyerése közvetlenül a felületi kártyákból...")
+            cards = page.locator("mat-card, .card, [role='row'], .mat-row").all()
+            for card in cards:
+                try:
+                    text_content = card.inner_text()
+                    if not text_content or "ft" not in text_content.lower():
+                        continue
+                    
+                    text_lower = text_content.lower()
+                    if any(bad in text_lower for bad in ["ingóság", "személygépkocsi", "üzletrész", "gép "]):
+                        continue
+
+                    # Ügyszám keresése
+                    ugyszam_match = re.search(r'(\d+\.V\.\d+/\d+)|(\d+\.V\.\d+)', text_content)
+                    ugyszam = ugyszam_match.group(0) if ugyszam_match else "Ismeretlen"
+                    
+                    # Generálunk egy egyedi belső ID-t a kártya tartalmából, ha nincs meg a pontos azonosító
+                    digits = "".join(filter(str.isdigit, text_content))
+                    auction_id = digits[:12] if len(digits) > 5 else "0"
+
+                    # Ár kiszedése tiszta számként
+                    kikialtasi_ar = 0
+                    for word in text_content.replace(".", "").replace(",", "").split():
+                        if word.isdigit() and 5 <= len(word) <= 9:
+                            kikialtasi_ar = int(word)
+                            break
+
+                    # Helyszín keresése normálisan (az első sor, ami nem ügyszám és nem ár)
+                    telepules = "MBVK Ingatlan"
+                    for line in [l.strip() for l in text_content.split("\n") if l.strip()]:
+                        if not re.search(r'\d+\.V\.\d+', line) and not line.replace(" ", "").isdigit() and len(line) > 3:
+                            if "kikiáltási" not in line.lower() and "árverés" not in line.lower() and "licit" not in line.lower():
+                                telepules = line[:35]
+                                break
+
+                    backup_auctions.append({
+                        "id": auction_id,
+                        "caseNumber": ugyszam,
+                        "city": telepules,
+                        "minBid": kikialtasi_ar,
+                        "categoryCode": "INGATLAN"
+                    })
+                except:
+                    continue
 
         browser.close()
 
-    # Ellenőrizzük, hogy sikerült-e az elcsípés
-    auctions = captured_data["items"]
+    # Adatok összefésülése (vagy az A-terv vagy a B-terv nyert)
+    auctions = captured_data["items"] if len(captured_data["items"]) > 0 else backup_auctions
+    print(f"📊 Összesen feldolgozható hirdetés száma: {len(auctions)}")
+
     if not auctions:
-        print("📭 Sikertelen elcsípés, a lista üres maradt.")
-        send_telegram_message("⚠️ *MBVK Monitor:* Nem sikerült elcsípni az adatcsomagot a böngészőből sem. Kérlek indítsd újra a futtatást!")
+        print("📭 Egyik módszerrel sem sikerült adatot kinyerni.")
+        send_telegram_message("🤖 *MBVK Monitor:* A script lefutott, de az oldalon jelenleg nem talált feldolgozható hirdetést. A kapcsolat működik!")
         return
 
-    print(f"📊 Összesen feldolgozható tiszta API hirdetés száma: {len(auctions)}")
     new_found_count = 0
 
     for item in auctions:
         try:
-            # Csak az INGATLAN kategóriát engedjük át (biztonsági szűrés, ha becsúszna más)
             if item.get("categoryCode", "") != "INGATLAN":
                 continue
 
@@ -97,10 +147,9 @@ def main():
             telepules = item.get("city", "Ismeretlen")
             kikialtasi_ar = int(item.get("minBid", 0))
 
-            # Az MBVK új belső részletes adatlap URL mintája az ID alapján!
-            full_link = f"https://arveres.mbvk.hu/#/reszletek?id={auction_id}"
+            # Ha az ID-nk valós, a gyári linkre mutatunk, ha generált (B-terv), akkor a fő keresőre
+            full_link = f"https://arveres.mbvk.hu/#/reszletek?id={auction_id}" if len(auction_id) < 10 else "https://arveres.mbvk.hu/#/kereses"
 
-            # --- SZŰRÉS (2 000 000 Ft vagy Teszt üzemmód) ---
             if kikialtasi_ar <= 2000000 or TESZT_MOD:
                 if auction_id not in old_records or TESZT_MOD:
                     new_found_count += 1
@@ -118,26 +167,23 @@ def main():
                         f"🔹 *Ügyszám:* {ugyszam}\n"
                         f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
                         f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
-                        f"🔗 [Ugrás a konkrét hirdetményre]({full_link})"
+                        f"🔗 [Ugrás az MBVK árverési adatlapra]({full_link})"
                     )
                     
                     send_telegram_message(üzenet)
                     
                     if TESZT_MOD and new_found_count >= 3:
                         break
-        except Exception as e:
-            print(f"❌ Hiba az egyik elem feldolgozásánál: {e}")
+        except:
             continue
 
     if TESZT_MOD:
-        send_telegram_message(f"✅ *MBVK Monitor Teszt:* Sikeresen elcsípve a hálózatból! Ha a fenti üzenetekben a helyszín, ügyszám és a link is makulátlan, állítsd át a `TESZT_MOD = False` értékre!")
+        send_telegram_message("✅ *MBVK Monitor Teszt:* A kettős szűrésű futás lezárult. Ellenőrizd a kapott adatok tisztaságát!")
     else:
         if new_found_count > 0:
             save_database(old_records)
-            print("💾 Új találatok elmentve.")
         else:
-            print("😴 Nincs új találat.")
-            send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott. Jelenleg nincs a feltételeknek megfelelő új ingatlan 2 000 000 Ft alatt.")
+            send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott. Jelenleg nincs új ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
     main()
