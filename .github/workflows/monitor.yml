@@ -2,6 +2,43 @@ name: MBVK Ingatlan Monitor
 
 on:
   schedule:
+    - cron: '0 5,17 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kód letöltése
+        uses: actions/checkout@v4
+
+      - name: Python környezet beállítása
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Függőségek telepítése
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright beautifulsoup4 requests
+          python -m playwright install chromium --with-deps
+
+      - name: Script futtatása
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python mbvk_monitor.py
+
+      - name: Adatbázis frissítése a repóban
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add mbvk_adatbazis.json || true
+          git commit -m "Adatbázis frissítése [skip ci]" || true
+          git push || truename: MBVK Ingatlan Monitor
+
+on:
+  schedule:
     # Minden nap lefut reggel 7-kor és este 7-kor (UTC szerint 05:00 és 17:00)
     - cron: '0 5,17 * * *'
   workflow_dispatch: # Így gombnyomással is bármikor elindíthatod tesztelésre
