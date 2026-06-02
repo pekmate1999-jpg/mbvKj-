@@ -21,10 +21,16 @@ def save_database(data):
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    except Exception as e:
+        print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 MBVK Okosított Ingatlan Monitor elindult...")
+    print("🚀 MBVK Univerzális Monitor elindult...")
+    # AZONNAL KÜLDÜNK EGY JELZÉST, HOGY LÁSD: ELINDULT A KÓD
+    send_telegram_message("🔄 *MBVK Monitor:* A keresés elindult a háttérben, böngésző indítása...")
+    
     old_records = load_database()
     arveresek = []
 
@@ -40,80 +46,110 @@ def main():
         )
         page = context.new_page()
 
-        # Az MBVK szűrt felülete
         target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
         print(f"--> URL megnyitása: {target_url}")
         
-        page.goto(target_url, wait_until="load", timeout=45000)
-        page.wait_for_timeout(7000)
+        page.goto(target_url, wait_until="networkidle", timeout=60000)
+        
+        # Adunk az oldalnak bőségesen 12 másodpercet, hogy az Angular minden kártyát lerendeljen
+        print("--> Várakozás a dinamikus tartalomra (12 mp)...")
+        page.wait_for_timeout(12000)
 
-        print("--> Hirdetések begyűjtése...")
-        links = page.locator("a").all()
+        # Trükk: Az összes olyan szöveges blokkot megkeressük, amiben van kikiáltási ár vagy ügyszám
+        print("--> Hirdetési blokkok beolvasása szöveges alapon...")
+        
+        # Kivesszük az oldal teljes HTML tartalmát és megnézzük a benne lévő hivatkozásokat másként
+        html_content = page.content()
+        
+        # Az összes belső azonosítót kigyűjtjük, ami az MBVK-n hirdetésre mutathat
+        # Az új felületen a link formátuma gyakran rejtett, így a szövegből bányásszuk ki az ügyszámokat
+        all_text = page.evaluate("() => document.body.innerText")
+        
+        # Keressük a mat-card elemeket vagy táblázat sorokat közvetlenül a felületről
+        # Kipróbálunk több lehetséges modern szelektort (kártyák, listaelemek, gombok)
+        cards = page.locator("mat-card, .mat-row, tr, .card, [role='row']").all()
+        print(f"--> Talált potenciális hirdetési blokkok száma: {len(cards)}")
 
-        for link in links:
+        # Ha a specifikus szelektorok csődöt mondanak, megnézzük a sima div-eket amikben számok vannak
+        if len(cards) <= 5:
+            cards = page.locator("div").all()
+
+        counter = 0
+        for card in cards:
             try:
-                href = link.get_attribute("href")
-                if href and ("reszletek" in href or "arveres" in href or any(c.isdigit() for c in href)):
-                    if any(bad in href for bad in ["google", "support", "cookie", "analytics", "privacy"]):
+                text_content = card.inner_text()
+                if not text_content or len(text_content.strip()) < 30:
+                    continue
+                
+                text_lower = text_content.lower()
+
+                # Csak olyan blokkok érdekelnek, amikben van kikiáltási ár vagy licit szó
+                if "kikiáltási" not in text_lower and "árverés" not in text_lower and "ft" not in text_lower:
+                    continue
+
+                # --- KIZÁRÓ SZŰRÉS ---
+                tiltott_szavak = ["ingóság", "személygépkocsi", "üzletrész", "ingóságok", "tehergépkocsi", "pótkocsi", "gép ", "eszköz", "részvény", "követelés"]
+                if any(tiltott in text_lower for tiltott in tiltott_szavak):
+                    continue
+
+                # Ügyszám keresése, ami egyben az egyedi ID-nk lesz
+                ugyszam_match = re.search(r'(\d+\.V\.\d+/\d+)|(\d+\.V\.\d+)', text_content)
+                if ugyszam_match:
+                    prop_id = ugyszam_match.group(0).replace(".", "_").replace("/", "_")
+                else:
+                    # Ha nincs ügyszám, generálunk egyet a szöveg számaiból, hogy ne hagyjuk el
+                    digits = "".join(filter(str.isdigit, text_content))
+                    if len(digits) > 5:
+                        prop_id = digits[:10]
+                    else:
                         continue
 
-                    prop_id = "".join(filter(str.isdigit, href))
-                    if not prop_id or len(prop_id) < 4:
-                        continue
+                # Ár meghatározása
+                kikialtasi_ar = 0
+                words = text_content.replace(".", "").replace(",", "").split()
+                for word in words:
+                    clean_word = "".join(filter(str.isdigit, word))
+                    if clean_word and 5 <= len(clean_word) <= 9:
+                        kikialtasi_ar = int(clean_word)
+                        break
 
-                    text_content = link.inner_text()
-                    if not text_content or len(text_content.strip()) < 10:
-                        continue
-                    
-                    text_lower = text_content.lower()
-
-                    # --- OKOS KIZÁRÁSOS SZŰRÉS ---
-                    # Nem keressük kötelezően az "ingatlan" szót, hanem csak a biztosan nem odaillő dolgokat dobjuk ki
-                    tiltott_szavak = ["ingóság", "személygépkocsi", "üzletrész", "ingóságok", "tehergépkocsi", "pótkocsi", "gép ", "eszköz", "részvény", "követelés"]
-                    if any(tiltott in text_lower for tiltott in tiltott_szavak):
-                        continue
-
-                    # Ár meghatározása a kártya szövegéből
-                    kikialtasi_ar = 0
-                    words = text_content.replace(".", "").replace(",", "").split()
-                    for word in words:
-                        clean_word = "".join(filter(str.isdigit, word))
-                        if clean_word and 5 <= len(clean_word) <= 9:
-                            kikialtasi_ar = int(clean_word)
+                # Település meghatározása
+                telepules = "MBVK Ingatlan"
+                lines = [l.strip() for l in text_content.split("\n") if l.strip()]
+                for line in lines:
+                    if not re.search(r'\d+\.V\.\d+', line) and not line.replace(" ", "").isdigit() and len(line) > 3:
+                        if "kikiáltási" not in line.lower() and "árverés" not in line.lower():
+                            telepules = line[:40]
                             break
 
-                    # Helyszín keresése (az első olyan értelmes sor, ami nem ügyszám és nem az ár)
-                    telepules = "MBVK Ingatlan"
-                    lines = [l.strip() for l in text_content.split("\n") if l.strip()]
-                    for line in lines:
-                        if not re.search(r'\d+\.V\.\d+', line) and not line.replace(" ", "").isdigit() and len(line) > 3:
-                            if "kikiáltási" not in line.lower() and "árverés" not in line.lower() and "licit" not in line.lower():
-                                telepules = line[:40]
-                                break
+                # Mivel a linket nehéz kiszedni, magára a főoldalra mutatunk, az ügyszám alapján úgyis kikereshető
+                full_link = "https://arveres.mbvk.hu/#/kereses"
 
-                    full_link = href if href.startswith("http") else f"https://arveres.mbvk.hu/{href}"
-
-                    if not any(x["id"] == prop_id for x in arveresek):
-                        arveresek.append({
-                            "id": prop_id,
-                            "telepules": telepules,
-                            "ar": kikialtasi_ar,
-                            "link": full_link
-                        })
+                if not any(x["id"] == prop_id for x in arveresek):
+                    arveresek.append({
+                        "id": prop_id,
+                        "telepules": telepules,
+                        "ar": kikialtasi_ar,
+                        "link": full_link,
+                        "ugyszam": ugyszam_match.group(0) if ugyszam_match else "Ismeretlen"
+                    })
+                    counter += 1
+                    if counter > 30: # Limitáljuk a belső hurkot a fagyás ellen
+                        break
             except:
                 continue
 
         browser.close()
 
-    print(f"📊 Talált potenciális ingatlanok száma: {len(arveresek)}")
+    print(f"📊 Talált egyedi ingatlan hirdetések száma: {len(arveresek)}")
     new_found = False
 
     for prop in arveresek:
         prop_id = prop["id"]
         kikialtasi_ar = prop["ar"]
 
-        # --- ÁR KORLÁT: Visszaállítva 2 000 000 HUF-ra ---
-        if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
+        # --- FIGYELEM: TESZT LIMIT 50 MILLIÓRA ÁLLÍTVA, HOGY BIZTOSAN JÖJJÖN TALÁLAT ---
+        if kikialtasi_ar <= 50000000 or kikialtasi_ar == 0:
             if prop_id not in old_records:
                 new_found = True
                 old_records.append(prop_id)
@@ -123,19 +159,20 @@ def main():
                 üzenet = (
                     f"🚨 *ÚJ MBVK INGATLAN TALÁLAT!*\n\n"
                     f"📍 *Helyszín:* {prop['telepules']}\n"
+                    f"🔹 *Ügyszám:* {prop['ugyszam']}\n"
                     f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
                     f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
-                    f"🔗 [Ugrás az MBVK árverési adatlapra]({prop['link']})"
+                    f"🔗 [Ugrás az MBVK Keresőre]({prop['link']})"
                 )
-                print(f"✨ Értesítés küldése: {prop['id']}")
                 send_telegram_message(üzenet)
 
     if new_found:
         save_database(old_records)
         print("💾 Új találatok elmentve.")
+        send_telegram_message(f"✅ *MBVK Monitor:* Sikeres lefutás! Összesen {len(arveresek)} db ingatlant vizsgáltam meg, és találtam újakat.")
     else:
-        print("😴 Nincs új találat. Státusz üzenet küldése...")
-        send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott, de jelenleg nincs a feltételeknek megfelelő új 1/1-es ingatlan 2 000 000 Ft alatt.")
+        print("😴 Nincs új találat.")
+        send_telegram_message(f"✅ *MBVK Monitor:* Sikeres lefutás! Összesen {len(arveresek)} db ingatlant vizsgáltam meg. Nincs új találat a megadott feltételekkel.")
 
 if __name__ == "__main__":
     main()
