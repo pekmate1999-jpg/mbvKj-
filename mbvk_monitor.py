@@ -34,74 +34,98 @@ def scrape_with_network_intercept():
         context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
 
-        # Elfogjuk a hálózati válaszokat (Network Interception)
+        # Hálózati forgalom figyelése és elcsípése
         def handle_response(response):
-            # Ha a válasz URL-je az MBVK belső kereső/hirdetmény végpontja
-            if "api/v1/arveresek" in response.url or "kereses" in response.url or "hirdetmeny" in response.url:
+            # Minden olyan API hívást figyelünk, amiben szerepel az arveres vagy kereses szó
+            if "arveres" in response.url.lower() or "keres" in response.url.lower() or "api/v1" in response.url.lower():
                 try:
-                    # Ha JSON adatot kaptunk vissza a szervertől
                     if "application/json" in response.headers.get("content-type", ""):
                         json_data = response.json()
-                        print(f"--> Sikerült elcsípni egy adatcsomagot az API-ból! URL: {response.url}")
+                        print(f"--> SIKER! Elcsípett adatcsomag: {response.url}")
                         
-                        # Az MBVK API struktúrája szerint a hirdetések általában a 'content' vagy a fő listában vannak
+                        # Megkeressük a hirdetéseket a JSON-ben (content kulcs vagy sima lista)
                         items = json_data.get("content", json_data if isinstance(json_data, list) else [])
+                        if isinstance(items, dict) and not isinstance(items, list):
+                            # Ha esetleg más kulcs alatt lennének az adatok
+                            for key in ["arveresek", "adatok", "list"]:
+                                if key in json_data:
+                                    items = json_data[key]
+                                    break
+                                    
                         if isinstance(items, list):
                             for item in items:
                                 captured_data.append(item)
-                except Exception as e:
+                except:
                     pass
 
         page.on("response", handle_response)
 
-        print("--> MBVK oldal megnyitása és hálózati forgalom figyelése...")
+        print("--> MBVK főoldal megnyitása...")
         page.goto("https://arveres.mbvk.hu/", wait_until="networkidle", timeout=60000)
 
-        # Várunk egy kicsit, hogy az összes háttérben futó API kérés biztosan befejeződjön
-        page.wait_for_timeout(6000)
+        # 1. Sütik kötelező elfogadása, hogy látszódjon a kereső gomb
+        page.wait_for_timeout(2000)
+        cookie_btn = page.locator("button#s-all-bn, button:has-text('Mindet elfogadom')")
+        if cookie_btn.count() > 0:
+            cookie_btn.first.click()
+            print("--> Süti panel lecsukva.")
+            page.wait_for_timeout(1000)
+
+        # 2. AKTÍVAN rákattintunk a Keresés gombra a felületen, hogy kikényszerítsük az API hívást!
+        print("--> Keresés gomb megnyomása a felületen...")
+        # Megkeressük a gombot szöveg vagy típus alapján (az elküldött HTML-edben szereplő gombok alapján)
+        search_btn = page.locator("button:has-text('Keresés'), input[type='submit'], .search-button")
+        if search_btn.count() > 0:
+            search_btn.first.click()
+            print("--> Gomb sikeresen megnyomva, várakozás az adatokra...")
+            page.wait_for_timeout(6000)
+        else:
+            print("⚠️ Nem találtam Keresés gombot a megadott szelektorokkal, megpróbálunk hosszabban várni...")
+            page.wait_for_timeout(8000)
+
         browser.close()
 
     return captured_data
 
 def main():
-    print("🚀 MBVK Hálózati Figyelő elindult.")
+    print("🚀 MBVK Kikényszerített Monitor elindult.")
     old_records = load_database()
     
     raw_items = scrape_with_network_intercept()
-    print(f"📊 Összesen elcsípett nyers API hirdetés: {len(raw_items)}")
+    print(f"📊 Összesen elcsípett nyers API hirdetés száma: {len(raw_items)}")
     
     arveresek = []
     for item in raw_items:
-        # Kulcsok normalizálása az MBVK változó API struktúrájához
-        prop_id = str(item.get("id") or item.get("arveresId") or item.get("hirdetmenyId", ""))
+        if not isinstance(item, dict):
+            continue
+            
+        # Egyedi azonosító keresése az API-ban
+        prop_id = str(item.get("id") or item.get("arveresId") or item.get("hirdetmenyId") or item.get("ugyszam", ""))
         if not prop_id:
             continue
 
-        # Szűrések ellenőrzése közvetlenül a tiszta adatokból
-        kategoria = str(item.get("kategoria", "")).upper()
-        allapot = str(item.get("arveresAllapota", item.get("allapot", ""))).upper()
-        tulajdon = str(item.get("tulajdoniHanyad", item.get("tulajdon", "")))
-        tehermentes = item.get("tehermentes")
-        bekoltozheto = item.get("bekoltozheto")
+        # Tiszta adatok kinyerése a JSON-ből
+        kategoria = str(item.get("kategoria", item.get("tipus", ""))).upper()
+        allapot = str(item.get("arveresAllapota", item.get("allapot", "AKTIV"))).upper()
+        tulajdon = str(item.get("tulajdoniHanyad", item.get("tulajdon", "1/1")))
         
-        # Ár kinyerése
+        # Ár kinyerése (többféle mezőnevet is megnézünk)
         kikialtasi_ar = item.get("kikialtasiAr") or item.get("minimalAr") or item.get("aktualisAr") or item.get("ar", 0)
         telepules = item.get("telepules", item.get("ingatlanTelepules", "Ismeretlen település"))
         ugyszam = item.get("ugyszam", "Nincs megadva")
 
-        # --- AZ ELŐSZŰRÉS ELLENŐRZÉSE ---
-        # Ha az API alapból mindent visszaad, a Python itt helyben szűri le neked:
-        # Ha a kategória üres (mert nem kaptuk meg), akkor is átengedjük, hogy ne veszítsünk adatot
-        if kategoria and "INGATLAN" not in kategoria:
+        # --- PYTHON ALAPÚ SZIGORÚ SZŰRÉS ---
+        # Ha a kategória meg van adva, és nem ingatlan, eldobjuk
+        if kategoria and "INGATLAN" not in kategoria and "LAKO" not in kategoria:
             continue
-        if allapot and "AKTIV" not in allapot:
+        # Csak az aktívak kellenek
+        if "AKTIV" not in allapot and "FUT" not in allapot:
             continue
-            
-        # Ha tört tulajdon (pl 1/2), akkor átugorjuk
-        if tulajdon and tulajdon != "1/1" and "1/" in tulajdon:
+        # Csak az 1/1 tulajdon kell (ha tört, pl. 1/2, kihagyjuk)
+        if tulajdon != "1/1" and ("1/" in tulajdon or "2/" in tulajdon or "3/" in tulajdon):
             continue
-            
-        # Mentjük a szűrt listába
+
+        # Ha átment a szűrőkön, hozzáadjuk az ellenőrzendő listához
         if not any(x["id"] == prop_id for x in arveresek):
             arveresek.append({
                 "id": prop_id,
@@ -111,14 +135,15 @@ def main():
                 "link": f"https://arveres.mbvk.hu/arveres/{prop_id}"
             })
 
-    print(f"🔍 Szűrések után megmaradt releváns ingatlanok száma: {len(arveresek)}")
+    print(f"🔍 Kritériumnak megfelelő (Ingatlan, 1/1) darabszám: {len(arveresek)}")
     new_found = False
 
     for prop in arveresek:
         prop_id = prop["id"]
         kikialtasi_ar = prop["ar"]
 
-        # --- SZIGORÚ ÁR-KORLÁT: Max 2 000 000 HUF ---
+        # --- ÁR KORLÁT: Max 2 000 000 HUF ---
+        # Ha a kölkedihez hasonlóan 2 millió alatt van, vagy nem sikerült kiolvasni (0)
         if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
             if prop_id not in old_records:
                 new_found = True
@@ -134,14 +159,14 @@ def main():
                     f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
                     f"🔗 [Ugrás az MBVK árverési adatlapra]({prop['link']})"
                 )
-                print(f"✨ Telegram értesítés küldése: {prop['telepules']} - {ar_kiiras}")
+                print(f"✨ Értesítés küldése -> {prop['telepules']}")
                 send_telegram_message(üzenet)
 
     if new_found:
         save_database(old_records)
-        print("💾 Új rekordok elmentve az adatbázisba.")
+        print("💾 Új találatok elmentve.")
     else:
-        print("😴 Nem találtam a feltételeknek megfelelő új ingatlant.")
+        print("😴 Nem találtam a feltételeknek megfelelő ÚJ ingatlant.")
 
 if __name__ == "__main__":
     main()
