@@ -24,7 +24,7 @@ def send_telegram_message(text):
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
 def main():
-    print("🚀 MBVK Szigorított Ingatlan Monitor elindult...")
+    print("🚀 MBVK Okosított Ingatlan Monitor elindult...")
     old_records = load_database()
     arveresek = []
 
@@ -40,13 +40,14 @@ def main():
         )
         page = context.new_page()
 
+        # Az MBVK szűrt felülete
         target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
         print(f"--> URL megnyitása: {target_url}")
         
         page.goto(target_url, wait_until="load", timeout=45000)
         page.wait_for_timeout(7000)
 
-        print("--> Hirdetési elemek szűrése...")
+        print("--> Hirdetések begyűjtése...")
         links = page.locator("a").all()
 
         for link in links:
@@ -61,34 +62,32 @@ def main():
                         continue
 
                     text_content = link.inner_text()
-                    if not text_content:
+                    if not text_content or len(text_content.strip()) < 10:
                         continue
                     
                     text_lower = text_content.lower()
 
-                    # --- SZIGORÚ INGATLAN SZŰRÉS ---
-                    tiltott_szavak = ["ingóság", "személygépkocsi", "üzletrész", "ingóságok", "tehergépkocsi", "pótkocsi", "gép", "eszköz"]
+                    # --- OKOS KIZÁRÁSOS SZŰRÉS ---
+                    # Nem keressük kötelezően az "ingatlan" szót, hanem csak a biztosan nem odaillő dolgokat dobjuk ki
+                    tiltott_szavak = ["ingóság", "személygépkocsi", "üzletrész", "ingóságok", "tehergépkocsi", "pótkocsi", "gép ", "eszköz", "részvény", "követelés"]
                     if any(tiltott in text_lower for tiltott in tiltott_szavak):
                         continue
-                    
-                    if "ingatlan" not in text_lower and "lakóház" not in text_lower and "lakás" not in text_lower and "telek" not in text_lower:
-                        continue
 
-                    # Ár meghatározása
+                    # Ár meghatározása a kártya szövegéből
                     kikialtasi_ar = 0
-                    words = text_content.replace(".", "").split()
+                    words = text_content.replace(".", "").replace(",", "").split()
                     for word in words:
                         clean_word = "".join(filter(str.isdigit, word))
                         if clean_word and 5 <= len(clean_word) <= 9:
                             kikialtasi_ar = int(clean_word)
                             break
 
-                    # Intelligens helyszín keresés
+                    # Helyszín keresése (az első olyan értelmes sor, ami nem ügyszám és nem az ár)
                     telepules = "MBVK Ingatlan"
                     lines = [l.strip() for l in text_content.split("\n") if l.strip()]
                     for line in lines:
                         if not re.search(r'\d+\.V\.\d+', line) and not line.replace(" ", "").isdigit() and len(line) > 3:
-                            if "kikiáltási" not in line.lower() and "árverés" not in line.lower():
+                            if "kikiáltási" not in line.lower() and "árverés" not in line.lower() and "licit" not in line.lower():
                                 telepules = line[:40]
                                 break
 
@@ -106,15 +105,15 @@ def main():
 
         browser.close()
 
-    print(f"📊 Valódi, szűrt ingatlanok száma: {len(arveresek)}")
+    print(f"📊 Talált potenciális ingatlanok száma: {len(arveresek)}")
     new_found = False
 
     for prop in arveresek:
         prop_id = prop["id"]
         kikialtasi_ar = prop["ar"]
 
-        # Max 2 000 000 HUF limit
-        if kikialtasi_ar <= 50000000 or kikialtasi_ar == 0:
+        # --- ÁR KORLÁT: Visszaállítva 2 000 000 HUF-ra ---
+        if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
             if prop_id not in old_records:
                 new_found = True
                 old_records.append(prop_id)
@@ -135,8 +134,7 @@ def main():
         save_database(old_records)
         print("💾 Új találatok elmentve.")
     else:
-        # --- ÚJ: Státuszjelentés küldése, ha nem volt új találat ---
-        print("😴 Nem találtam új hirdetést. Státusz üzenet küldése...")
+        print("😴 Nincs új találat. Státusz üzenet küldése...")
         send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott, de jelenleg nincs a feltételeknek megfelelő új 1/1-es ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
