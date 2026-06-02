@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import re
 from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -23,7 +24,7 @@ def send_telegram_message(text):
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
 def main():
-    print("🚀 MBVK Könnyített Monitor elindult...")
+    print("🚀 MBVK Szigorított Ingatlan Monitor elindult...")
     old_records = load_database()
     arveresek = []
 
@@ -39,39 +40,44 @@ def main():
         )
         page = context.new_page()
 
-        # Közvetlen szűrt URL megnyitása (Ingatlan, Aktív, 1/1, tehermentes, beköltözhető)
+        # Megnyitjuk a keresőt
         target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
         print(f"--> URL megnyitása: {target_url}")
         
         page.goto(target_url, wait_until="load", timeout=45000)
-        
-        # Biztonsági várakozás, amíg az Angular felépíti a kártyákat
-        page.wait_for_timeout(6000)
+        page.wait_for_timeout(7000)
 
         print("--> Hirdetési elemek szűrése...")
-        # Kiválasztjuk az összes linket az oldalon
         links = page.locator("a").all()
-        print(f"--> Talált linkek száma elemzésre: {len(links)}")
 
         for link in links:
             try:
                 href = link.get_attribute("href")
                 if href and ("reszletek" in href or "arveres" in href or any(c.isdigit() for c in href)):
-                    # Külső és téves linkek kiszűrése azonnal
                     if any(bad in href for bad in ["google", "support", "cookie", "analytics", "privacy"]):
                         continue
 
-                    # ID kinyerése a linkből
                     prop_id = "".join(filter(str.isdigit, href))
                     if not prop_id or len(prop_id) < 4:
                         continue
 
-                    # Szöveg kiolvasása közvetlenül a kártya linkjéből
                     text_content = link.inner_text()
                     if not text_content:
                         continue
+                    
+                    text_lower = text_content.lower()
 
-                    # Ár meghatározása: megkeressük az első olyan számcsoportot, ami reális értékű
+                    # --- SZIGORÚ INGATLAN SZŰRÉS ---
+                    # Ha a szövegben benne van bármi, ami ingóságra utal, vagy NINCS benne az ingatlan/lakóház szó, eldobjuk
+                    tiltott_szavak = ["ingóság", "személygépkocsi", "üzletrész", "ingóságok", "tehergépkocsi", "pótkocsi", "gép", "eszköz"]
+                    if any(tiltott in text_lower for tiltott in tiltott_szavak):
+                        continue
+                    
+                    # Ha az oldal figyelmen kívül hagyta az URL szűrőt, itt manuálisan megköveteljük az ingatlan kulcsszót
+                    if "ingatlan" not in text_lower and "lakóház" not in text_lower and "lakás" not in text_lower and "telek" not in text_lower:
+                        continue
+
+                    # Ár meghatározása
                     kikialtasi_ar = 0
                     words = text_content.replace(".", "").split()
                     for word in words:
@@ -80,9 +86,15 @@ def main():
                             kikialtasi_ar = int(clean_word)
                             break
 
-                    # Település meghatározása a kártya első sorából
+                    # Intelligens helyszín keresés: Megkeressük az első olyan sort, ami nem ügyszám és nem üres
+                    telepules = "MBVK Ingatlan"
                     lines = [l.strip() for l in text_content.split("\n") if l.strip()]
-                    telepules = lines[0][:40] if lines else "MBVK Ingatlan"
+                    for line in lines:
+                        # Ha a sor nem tartalmaz ügyszám formátumot (pl. .V. vagy /202) és nem csak számokból áll
+                        if not re.search(r'\d+\.V\.\d+', line) and not line.replace(" ", "").isdigit() and len(line) > 3:
+                            if "kikiáltási" not in line.lower() and "árverés" not in line.lower():
+                                telepules = line[:40]
+                                break
 
                     full_link = href if href.startswith("http") else f"https://arveres.mbvk.hu/{href}"
 
@@ -98,14 +110,14 @@ def main():
 
         browser.close()
 
-    print(f"📊 Összesen feldolgozott tiszta hirdetés: {len(arveresek)}")
+    print(f"📊 Valódi, szűrt ingatlanok száma: {len(arveresek)}")
     new_found = False
 
     for prop in arveresek:
         prop_id = prop["id"]
         kikialtasi_ar = prop["ar"]
 
-        # --- ÁR SZŰRÉS: Max 2 000 000 HUF ---
+        # Max 2 000 000 HUF limit
         if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
             if prop_id not in old_records:
                 new_found = True
@@ -120,14 +132,14 @@ def main():
                     f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
                     f"🔗 [Ugrás az MBVK árverési adatlapra]({prop['link']})"
                 )
-                print(f"✨ Telegram értesítés kiküldve: {prop['id']}")
+                print(f"✨ Értesítés küldése: {prop['id']}")
                 send_telegram_message(üzenet)
 
     if new_found:
         save_database(old_records)
-        print("💾 Új találatok elmentve az adatbázisba.")
+        print("💾 Új találatok elmentve.")
     else:
-        print("😴 Nem találtam a feltételeknek megfelelő ÚJ hirdetést.")
+        print("😴 Nem találtam új, kritériumoknak megfelelő ingatlant.")
 
 if __name__ == "__main__":
     main()
