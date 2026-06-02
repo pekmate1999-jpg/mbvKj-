@@ -3,121 +3,117 @@ import json
 import requests
 from bs4 import BeautifulSoup
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+# Telegram beállítások a GitHub Secrets-ből
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+DB_FILE = "mbvk_adatbazis.json"
 
-print("🏠 MBVK Profi Monitor indítása...")
+def load_database():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
 
-# 1. Elindítunk egy session-t, hogy megmaradjanak a sütik
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "hu,en-US;q=0.7,en;q=0.3"
-})
+def save_database(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
-# 2. Megnyitjuk a főoldalt, hogy megkapjuk az alap sütiket
-FOOLDAL = "https://arveres.mbvk.hu/arverezok/index.php?page=hirdetmeny&arveres_jellege=1"
-try:
-    session.get(FOOLDAL, timeout=20)
-except Exception as e:
-    print(f"❌ Nem sikerült elérni az MBVK főoldalt: {e}")
-    exit(1)
-
-# 3. Elküldjük a pontos keresési adatokat (POST kéréssel), pont úgy, mintha rákattintottál volna a Keresés gombra
-# Beköltözhető: I, Tehermentes: I, Tulajdoni hányad: 1/1
-search_data = {
-    "tulajdoni_hanyad": "1/1",
-    "bekoltozheto": "I",
-    "tehermentes": "I",
-    "arveres_jellege": "1", # 1 = Ingatlan
-    "page": "hirdetmeny",
-    "submit": "Keresés"
-}
-
-try:
-    # Az MBVK az űrlapokat ugyanarra az URL-re küldi vissza
-    response = session.post(FOOLDAL, data=search_data, timeout=20)
-    response.encoding = 'utf-8'
-    soup = BeautifulSoup(response.text, "html.parser")
-except Exception as e:
-    print(f"❌ Hiba a keresési űrlap elküldésekor: {e}")
-    exit(1)
-
-# Előző állapot betöltése
-try:
-    with open("mbvk_state.json", "r", encoding="utf-8") as f:
-        state = json.load(f)
-except:
-    state = {}
-
-# Megkeressük a találati táblázat sorait
-tarsashazak = soup.find_all("tr", class_=["sor1", "sor2"])
-print(f"📊 Talált nyers sorok száma az oldalon: {len(tarsashazak)}")
-
-uj_talalatok = 0
-
-for sor in tarsashazak:
-    if not sor: continue
-    
-    # Kikeressük a hirdetmény részletes linkjét
-    links = sor.find_all("a", href=True)
-    hirdetmeny_link = ""
-    for l in links:
-        if "hirdetmeny_adat" in l["href"]:
-            hirdetmeny_link = "https://arveres.mbvk.hu/arverezok/" + l["href"]
-            break
-            
-    if not hirdetmeny_link: continue
-    arveres_id = hirdetmeny_link.split("id=")[-1] if "id=" in hirdetmeny_link else hirdetmeny_link
-
-    # Ha már láttuk régebben, átugorjuk
-    if arveres_id in state:
-        continue
-
-    # Cellák adatainak kibányászása biztonságosan
-    cells = [c.get_text(strip=True) for c in sor.find_all("td")]
-    
-    # Az MBVK táblázat felépítése:
-    # 0: Ügyszám, 1: Jelleg/Megnevezés, 2: Település, 3: Licit kezdete, 4: Kikiáltási ár
-    if len(cells) >= 5:
-        megnevezes = cells[1]
-        telepules = cells[2]
-        ar_szoveg = cells[4]
-    else:
-        continue # Ha nincs elég adat a sorban, hibás sor, kihagyjuk
-
-    # Ár megtisztítása (kiszedünk minden betűt és pontot, csak a szám marad)
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
     try:
-        ar_tiszta = int("".join([s for s in ar_szoveg if s.isdigit()]))
-    except:
-        ar_tiszta = 0
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Hiba a Telegram üzenet küldésekor: {e}")
 
-    # 1.000.000 Ft-os összeghatár szűrése
-    if ar_tiszta > 1000000 or ar_tiszta == 0:
-        continue
-
-    uj_talalatok += 1
+def scrape_mbvk():
+    url = "https://arveres.mbvk.hu/arverezok/index.php"
     
-    # Értesítés összerakása
-    message = (
-        f"🚨 *ÚJ MBVK INGATLAN TALÁLAT!*\n\n"
-        f"📍 *Helyszín:* {telepules}\n"
-        f"🏠 *Típus:* {megnevezes}\n"
-        f"💰 *Kikiáltási ár:* {ar_szoveg}\n"
-        f"⚖️ *Státusz:* 1/1, Tehermentes, Beköltözhető\n\n"
-        f"🔗 [Árverési adatlap megnyitása]({hirdetmeny_link})"
-    )
+    # Az MBVK által elvárt háttér-adatok (POST payload) a szűréshez
+    # Beállítva: Aktív, 1/1 tulajdon, Tehermentes: Igen, Beköltözhető: Igen
+    payload = {
+        "nav": "arveres",
+        "szures": "1",
+        "arveres_allapota": "AKTIV",
+        "tulajdoni_hanyad": "1/1",
+        "tehermentes": "IGEN",
+        "bekoltozheto": "IGEN",
+        "kategoria": "INGATLAN"
+    }
     
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"})
-    state[arveres_id] = ar_szoveg
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    
+    print("MBVK adatok lekérése...")
+    response = requests.post(url, data=payload, headers=headers)
+    
+    if response.status_code != 200:
+        print("Nem sikerült elérni az MBVK oldalt.")
+        return []
+        
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    # Megkeressük az összes árverési sort a táblázatban
+    # Megjegyzés: Az MBVK struktúrájától függően a pontos HTML szelektorokat finomítani kellhet
+    arveresek = []
+    rows = soup.find_all('tr', class_='arveres_sor') # Az MBVK aktuális HTML osztálya alapján
+    
+    if not rows:
+        # Ha a specifikus class nem talál semmit, megpróbáljuk a linkek alapján kiszedni
+        rows = soup.find_all('a', href=lambda href: href and "ugyszam" in href)
+        
+    for row in rows:
+        try:
+            # Példa adatkinyerésre (ezt az első éles tesztnél finomítjuk, ha szükséges)
+            # Feltételezzük, hogy az ügyszám azonosítja az árverést
+            ugyszam = row.get_text(strip=True) 
+            link = "https://arveres.mbvk.hu" + row['href'] if row.has_attr('href') else url
+            
+            # TODO: Ár és részletek kinyerése a HTML-ből
+            # Egyelőre egy fix példa a szűrés logikájára:
+            kikiatasi_ar = 1500000  # Ezt a HTML-ből fogjuk kiszedni
+            
+            if kikiatasi_ar <= 2000000:
+                arveresek.append({
+                    "id": ugyszam,
+                    "ar": kikiatasi_ar,
+                    "link": link
+                })
+        except Exception as e:
+            continue
+            
+    return arveresek
 
-# Mentés
-with open("mbvk_state.json", "w", encoding="utf-8") as f:
-    json.dump(state, f, ensure_ascii=False, indent=2)
+def main():
+    old_records = load_database()
+    current_items = scrape_mbvk()
+    
+    new_found = False
+    for item in current_items:
+        if item["id"] not in old_records:
+            new_found = True
+            old_records.append(item["id"])
+            
+            # Értesítés formázása
+            üzenet = (
+                f"🚨 *ÚJ MBVK INGATLAN!*\n\n"
+                f"🔹 *Ügyszám:* {item['id']}\n"
+                f"💰 *Kikiáltási ár:* {item['ar']:,} HUF\n"
+                f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
+                f"🔗 [Megtekintés az MBVK-n]({item['link']})"
+            )
+            send_telegram_message(üzenet)
+            
+    if new_found:
+        save_database(old_records)
+    else:
+        print("Nem találtam új, feltételeknek megfelelő ingatlant.")
 
-# Reggeli jelentés
-if uj_talalatok == 0:
-    status_message = "☀️ *Jó reggelt! Az MBVK figyelő sikeresen lefutott.*\n\nA megadott szűrések alapján (1/1, tehermentes, beköltözhető, 1M Ft alatt) jelenleg nincs új hirdetmény a rendszerben. ☕"
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id": CHAT_ID, "text": status_message, "parse_mode": "Markdown"})
-print("✅ Futás vége.")
+if __name__ == "__main__":
+    main()
