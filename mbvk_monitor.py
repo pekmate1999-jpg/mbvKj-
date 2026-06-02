@@ -1,15 +1,14 @@
 import os
 import json
 import requests
+import time
 from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DB_FILE = "mbvk_adatbazis.json"
 
-# === TESZT MÓD BEÁLLÍTÁS ===
-# Ha True, az első futásnál kiküld 3 mintát az adatok ellenőrzéséhez.
-# Ha a kapott helyszín és link tökéletes, állítsd át False-ra!
+# === TESZT MÓD ===
 TESZT_MOD = True 
 
 def load_database():
@@ -31,74 +30,77 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 MBVK Közvetlen API Monitor elindult...")
+    print("🚀 MBVK Hibrid Adat-Elcsípő Monitor elindult...")
     old_records = load_database()
-    captured_auctions = []
+    
+    # Ebbe a listába mentjük el, amit a hálózatból elkapunk
+    captured_data = {"items": []}
 
     with sync_playwright() as p:
-        print("--> API Kliens indítása...")
-        # Nem nyitunk nehéz böngésző ablakot, közvetlenül a Playwright hálózati motorját használjuk
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-        
-        # Összeállítjuk a pontos API URL-t a szűrésekkel
-        # Ingatlan, Aktív, 1/1, Tehermentes, Beköltözhető (phaseCode=online_ingo_2021 az alapértelmezett rendszerkódjuk)
-        api_url = (
-            "https://arveres.mbvk.hu/publicapi/auction/list?"
-            "offset=0&limit=50&sortMod=feltolt&sortDirection=desc"
-            "&phaseCode=online_ingo_2021&isLive=true"
+        print("--> Virtuális Chrome indítása...")
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        page = context.new_page()
+
+        # Eseménykezelő: Figyeljük a háttérben futó hálózati válaszokat
+        def on_response(response):
+            if "publicapi/auction/list" in response.url:
+                try:
+                    json_res = response.json()
+                    if "items" in json_res and len(json_res["items"]) > 0:
+                        captured_data["items"] = json_res["items"]
+                        print(f"🎯 SIKER! Elcsípve {len(json_res['items'])} db hirdetés a hálózati forgalomból!")
+                except Exception as e:
+                    print(f"❌ Hiba a háttér-JSON olvasásakor: {e}")
+
+        page.on("response", on_response)
+
+        # Megnyitjuk a rendes szűrt felületet
+        target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
+        print(f"--> Oldal megnyitása: {target_url}")
         
-        print("--> Közvetlen belső API lekérdezés...")
-        try:
-            response = page.request.get(
-                api_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Referer": "https://arveres.mbvk.hu/"
-                }
-            )
-            
-            if response.ok:
-                json_data = response.json()
-                captured_auctions = json_data.get("items", [])
-                print(f"📡 API Sikeres! Kapott nyers hirdetések száma: {len(captured_auctions)}")
-            else:
-                print(f"❌ API Hiba kód: {response.status}")
-        except Exception as e:
-            print(f"❌ Kivétel az API hívás során: {e}")
-            
+        page.goto(target_url, wait_until="load", timeout=60000)
+        
+        # Aktív várakozási ciklus: maximum 20 másodpercig várunk, hogy az elcsípő funkció megteljen adattval
+        print("--> Várakozás az API csomag beérkezésére...")
+        for _ in range(20):
+            if len(captured_data["items"]) > 0:
+                break
+            page.wait_for_timeout(1000)
+
         browser.close()
 
-    if not captured_auctions:
-        print("📭 Nem érkezett adat az MBVK szerverétől.")
-        send_telegram_message("⚠️ *MBVK Monitor:* Az MBVK szervere megtagadta a közvetlen lekérdezést. Kérlek próbáld újra pár perc múlva!")
+    # Ellenőrizzük, hogy sikerült-e az elcsípés
+    auctions = captured_data["items"]
+    if not auctions:
+        print("📭 Sikertelen elcsípés, a lista üres maradt.")
+        send_telegram_message("⚠️ *MBVK Monitor:* Nem sikerült elcsípni az adatcsomagot a böngészőből sem. Kérlek indítsd újra a futtatást!")
         return
 
+    print(f"📊 Összesen feldolgozható tiszta API hirdetés száma: {len(auctions)}")
     new_found_count = 0
 
-    for item in captured_auctions:
+    for item in auctions:
         try:
-            # Szigorú szűrés az API-ból érkező tiszta adatok alapján (háttérben ellenőrizzük az ingatlan státuszt)
-            kategoria = item.get("categoryCode", "")
-            
-            # Mivel a közös listát kértük le, itt manuálisan szűrjük ki az ingatlanokat
-            if kategoria != "INGATLAN":
+            # Csak az INGATLAN kategóriát engedjük át (biztonsági szűrés, ha becsúszna más)
+            if item.get("categoryCode", "") != "INGATLAN":
                 continue
 
-            # Csak azokat engedjük át, amik 1/1 tulajdonúak és beköltözhetők (ha az API-ban benne van a flag)
-            # Biztonsági okokból az API-ból érkező alapvető adatokat húzzuk be
             auction_id = str(item.get("id"))
             ugyszam = item.get("caseNumber", "Nincs megadva")
-            telepules = item.get("city", "Ismeretlen település")
-            kikialtasi_ar = int(item.get("minBid", 0)) 
+            telepules = item.get("city", "Ismeretlen")
+            kikialtasi_ar = int(item.get("minBid", 0))
 
-            # Közvetlen, gyári link az adatlapra az ID alapján
+            # Az MBVK új belső részletes adatlap URL mintája az ID alapján!
             full_link = f"https://arveres.mbvk.hu/#/reszletek?id={auction_id}"
 
-            # --- SZŰRÉSI LOGIKA ---
+            # --- SZŰRÉS (2 000 000 Ft vagy Teszt üzemmód) ---
             if kikialtasi_ar <= 2000000 or TESZT_MOD:
                 if auction_id not in old_records or TESZT_MOD:
                     new_found_count += 1
@@ -124,15 +126,18 @@ def main():
                     if TESZT_MOD and new_found_count >= 3:
                         break
         except Exception as e:
+            print(f"❌ Hiba az egyik elem feldolgozásánál: {e}")
             continue
 
     if TESZT_MOD:
-        send_telegram_message(f"✅ *MBVK Monitor Teszt:* Közvetlen API lekérés lefutott! Ha a fenti üzenetekben a helyszín és a link végre tökéletes, állítsd át a `TESZT_MOD = False` értékre!")
+        send_telegram_message(f"✅ *MBVK Monitor Teszt:* Sikeresen elcsípve a hálózatból! Ha a fenti üzenetekben a helyszín, ügyszám és a link is makulátlan, állítsd át a `TESZT_MOD = False` értékre!")
     else:
         if new_found_count > 0:
             save_database(old_records)
+            print("💾 Új találatok elmentve.")
         else:
-            send_telegram_message("✅ *MBVK Monitor:* A közvetlen API keresés sikeresen lefutott. Jelenleg nincs új ingatlan 2 000 000 Ft alatt.")
+            print("😴 Nincs új találat.")
+            send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott. Jelenleg nincs a feltételeknek megfelelő új ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
     main()
