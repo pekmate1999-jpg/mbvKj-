@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -23,148 +22,126 @@ def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
-def scrape_with_browser():
-    arveresek = []
-    
+def scrape_with_network_intercept():
+    captured_data = []
+
     with sync_playwright() as p:
-        print("--> Böngésző indítása...")
+        print("--> Virtuális Chrome indítása...")
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
-        
         context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
-        
-        print("--> MBVK főoldal betöltése...")
-        page.goto("https://arveres.mbvk.hu/", wait_until="networkidle", timeout=60000)
-        
-        try:
-            # 1. Sütik lekezelése gyorsan
-            page.wait_for_timeout(2000)
-            cookie_btn = page.locator("button#s-all-bn, button:has-text('Mindet elfogadom')")
-            if cookie_btn.count() > 0:
-                cookie_btn.first.click()
-                page.wait_for_timeout(1000)
-            
-            # 2. Szűrők élesítése gombok/kattintások alapján (ha nincsenek, az alap listából szűrünk)
-            print("--> Oldal elemeinek mélyelemzése...")
-            
-            # Megvárjuk, amíg a dinamikus tartalom biztosan renderelődik a képernyőre
-            page.wait_for_timeout(4000)
-            
-            html_content = page.content()
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Az Angular/Material oldalak egyedi hirdetmény-blokkokat használnak. 
-            # Megkeresünk minden olyan blokkot, div-et, linket, amiben ár vagy ügyszám lehet.
-            blocks = soup.find_all(['div', 'a', 'mat-card'], class_=lambda x: x and any(word in x.lower() for word in ['item', 'card', 'row', 'arveres', 'hirdetmeny']))
-            
-            # Biztonsági háló: Ha a modern div-ek nem adnak tiszta struktúrát, kigyűjtjük az összes létező linket
-            if not blocks:
-                blocks = soup.find_all('a', href=True)
-            
-            print(f"--> Feldolgozandó blokkok száma: {len(blocks)}")
-            
-            for idx, block in enumerate(blocks):
-                text_content = block.get_text(separator=" ", strip=True)
-                text_lower = text_content.lower()
-                
-                # Szigorú előszűrés a szöveges tartalomból: minket INGATLAN érdekel, ami tehermentes/1-1
-                # (Ha az oldal eleve szűrve tölt be, vagy ezek a szavak benne vannak a hirdetésben)
-                if "ft" in text_lower or "huf" in text_lower:
-                    link_tag = block if block.name == 'a' else block.find('a', href=True)
-                    if link_tag and link_tag.has_attr('href') and ("hirdetmeny" in link_tag['href'] or "arveres" in link_tag['href']):
-                        
-                        href = link_tag['href']
-                        link = href if href.startswith("http") else "https://arveres.mbvk.hu" + href
-                        
-                        # Egyedi ID kinyerése a linkből (számok)
-                        prop_id = ''.join(filter(str.isdigit, href))
-                        if not prop_id:
-                            prop_id = str(hash(link))
-                            
-                        # Ár kinyerése a szövegből intelligensen
-                        kikialtasi_ar = 0
-                        # Tisztítjuk a szöveget a felesleges karakterektől, csak a számcsoportokat nézzük
-                        words = text_content.replace(".", "").replace(" ", "").split()
-                        for word in words:
-                            clean_word = ''.join(filter(str.isdigit, word))
-                            if clean_word and len(clean_word) >= 6: # Legalább 100 000 Ft értékű számot keresünk
-                                try:
-                                    szam = int(clean_word)
-                                    if 100000 <= szam <= 100000000: # Reális tartomány egy ingatlan kikiáltási árának
-                                        kikialtasi_ar = szam
-                                        break
-                                except: pass
-                        
-                        # Próbálunk települést kiszedni a szöveg elejéből
-                        telepules = "Részletek a linken"
-                        for line in text_content.split("\n"):
-                            line_clean = line.strip()
-                            if len(line_clean) > 2 and not any(x in line_clean.lower() for x in ['ft', 'árverés', 'ügyszám', 'hirdetmény']):
-                                telepules = line_clean[:40]
-                                break
 
-                        # Hozzáadjuk a listához, ha még nem szerepel benne ez az ID
-                        if not any(item['id'] == prop_id for item in arveresek):
-                            arveresek.append({
-                                "id": prop_id,
-                                "telepules": telepules,
-                                "ar": kikialtasi_ar,
-                                "link": link,
-                                "raw_text": text_lower
-                            })
-                            
-        except Exception as e:
-            print(f"❌ Hiba történt: {e}")
-            
+        # Elfogjuk a hálózati válaszokat (Network Interception)
+        def handle_response(response):
+            # Ha a válasz URL-je az MBVK belső kereső/hirdetmény végpontja
+            if "api/v1/arveresek" in response.url or "kereses" in response.url or "hirdetmeny" in response.url:
+                try:
+                    # Ha JSON adatot kaptunk vissza a szervertől
+                    if "application/json" in response.headers.get("content-type", ""):
+                        json_data = response.json()
+                        print(f"--> Sikerült elcsípni egy adatcsomagot az API-ból! URL: {response.url}")
+                        
+                        # Az MBVK API struktúrája szerint a hirdetések általában a 'content' vagy a fő listában vannak
+                        items = json_data.get("content", json_data if isinstance(json_data, list) else [])
+                        if isinstance(items, list):
+                            for item in items:
+                                captured_data.append(item)
+                except Exception as e:
+                    pass
+
+        page.on("response", handle_response)
+
+        print("--> MBVK oldal megnyitása és hálózati forgalom figyelése...")
+        page.goto("https://arveres.mbvk.hu/", wait_until="networkidle", timeout=60000)
+
+        # Várunk egy kicsit, hogy az összes háttérben futó API kérés biztosan befejeződjön
+        page.wait_for_timeout(6000)
         browser.close()
-        
-    return arveresek
+
+    return captured_data
 
 def main():
-    print("🚀 MBVK Éles Monitor elindult.")
+    print("🚀 MBVK Hálózati Figyelő elindult.")
     old_records = load_database()
-    properties = scrape_with_browser()
     
-    print(f"📊 Összesen talált nyers hirdetés: {len(properties)}")
+    raw_items = scrape_with_network_intercept()
+    print(f"📊 Összesen elcsípett nyers API hirdetés: {len(raw_items)}")
+    
+    arveresek = []
+    for item in raw_items:
+        # Kulcsok normalizálása az MBVK változó API struktúrájához
+        prop_id = str(item.get("id") or item.get("arveresId") or item.get("hirdetmenyId", ""))
+        if not prop_id:
+            continue
+
+        # Szűrések ellenőrzése közvetlenül a tiszta adatokból
+        kategoria = str(item.get("kategoria", "")).upper()
+        allapot = str(item.get("arveresAllapota", item.get("allapot", ""))).upper()
+        tulajdon = str(item.get("tulajdoniHanyad", item.get("tulajdon", "")))
+        tehermentes = item.get("tehermentes")
+        bekoltozheto = item.get("bekoltozheto")
+        
+        # Ár kinyerése
+        kikialtasi_ar = item.get("kikialtasiAr") or item.get("minimalAr") or item.get("aktualisAr") or item.get("ar", 0)
+        telepules = item.get("telepules", item.get("ingatlanTelepules", "Ismeretlen település"))
+        ugyszam = item.get("ugyszam", "Nincs megadva")
+
+        # --- AZ ELŐSZŰRÉS ELLENŐRZÉSE ---
+        # Ha az API alapból mindent visszaad, a Python itt helyben szűri le neked:
+        # Ha a kategória üres (mert nem kaptuk meg), akkor is átengedjük, hogy ne veszítsünk adatot
+        if kategoria and "INGATLAN" not in kategoria:
+            continue
+        if allapot and "AKTIV" not in allapot:
+            continue
+            
+        # Ha tört tulajdon (pl 1/2), akkor átugorjuk
+        if tulajdon and tulajdon != "1/1" and "1/" in tulajdon:
+            continue
+            
+        # Mentjük a szűrt listába
+        if not any(x["id"] == prop_id for x in arveresek):
+            arveresek.append({
+                "id": prop_id,
+                "telepules": telepules,
+                "ar": int(kikialtasi_ar) if kikialtasi_ar else 0,
+                "ugyszam": ugyszam,
+                "link": f"https://arveres.mbvk.hu/arveres/{prop_id}"
+            })
+
+    print(f"🔍 Szűrések után megmaradt releváns ingatlanok száma: {len(arveresek)}")
     new_found = False
-    
-    for prop in properties:
+
+    for prop in arveresek:
         prop_id = prop["id"]
         kikialtasi_ar = prop["ar"]
-        raw_text = prop["raw_text"]
-        
-        # --- SZIGORÚ ÉLES SZŰRÉSI LOGIKA ---
-        # 1. Ár ellenőrzése: Max 2 000 000 Ft (Vagy 0, ha nem sikerült kiolvasni, a biztonság kedvéért)
+
+        # --- SZIGORÚ ÁR-KORLÁT: Max 2 000 000 HUF ---
         if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
-            
-            # 2. Kulcsszavak ellenőrzése a szövegben, ha az MBVK nem szűrt volna alapból:
-            # Csak akkor engedjük át, ha nem utal semmi arra, hogy pl. csak 1/2 tulajdon lenne
-            if "1/2" in raw_text or "2/4" in raw_text or "1/4" in raw_text:
-                continue # Kihagyjuk a tört tulajdonokat
-                
             if prop_id not in old_records:
                 new_found = True
                 old_records.append(prop_id)
-                
-                ar_szoveg = f"{kikialtasi_ar:,} HUF" if kikialtasi_ar > 0 else "Lásd az adatlapon"
-                
+
+                ar_kiiras = f"{kikialtasi_ar:,} HUF" if kikialtasi_ar > 0 else "Lásd az adatlapon"
+
                 üzenet = (
                     f"🚨 *ÚJ MBVK INGATLAN TALÁLAT!*\n\n"
-                    f"💰 *Kikiáltási ár:* {ar_szoveg}\n"
+                    f"📍 *Település:* {prop['telepules']}\n"
+                    f"🔹 *Ügyszám:* {prop['ugyszam']}\n"
+                    f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
                     f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
                     f"🔗 [Ugrás az MBVK árverési adatlapra]({prop['link']})"
                 )
-                print(f"✨ Értesítés kiküldése: ID {prop_id}")
+                print(f"✨ Telegram értesítés küldése: {prop['telepules']} - {ar_kiiras}")
                 send_telegram_message(üzenet)
-                
+
     if new_found:
         save_database(old_records)
-        print("💾 Az új rekordok sikeresen elmentve.")
+        print("💾 Új rekordok elmentve az adatbázisba.")
     else:
-        print("😴 Nem találtam új, a feltételeknek megfelelő hirdetést.")
+        print("😴 Nem találtam a feltételeknek megfelelő új ingatlant.")
 
 if __name__ == "__main__":
     main()
