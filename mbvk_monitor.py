@@ -118,7 +118,7 @@ def main():
         kikialtasi_ar = prop["ar"]
 
         # Max 2 000 000 HUF limit
-        if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
+        if kikialtasi_ar <= 50000000 or kikialtasi_ar == 0:
             if prop_id not in old_records:
                 new_found = True
                 old_records.append(prop_id)
