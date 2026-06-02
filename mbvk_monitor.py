@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import re
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
@@ -33,70 +34,70 @@ def scrape_direct_url():
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
         
-        # Valódi felhasználói környezet emulálása (User-Agent trükk)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800}
         )
         page = context.new_page()
         
-        # Közvetlen szűrt URL megnyitása (Ingatlan, Aktív, Tehermentes, Beköltözhető, 1/1)
-        # Az MBVK paraméterezése alapján az URL-be ágyazzuk a kérést
+        # Közvetlen szűrt URL megnyitása az MBVK-n
         target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
         
-        print(f"--> Közvetlen URL megnyitása: {target_url}")
-        page.goto(target_url, wait_until="load", timeout=60000)
+        print(f"--> URL megnyitása: {target_url}")
+        page.goto(target_url, wait_until="networkidle", timeout=60000)
         
-        # Várunk, amíg az Angular befejezi a táblázat vagy a kártyák kirajzolását
-        print("--> Várakozás a tartalom lerendelésére...")
+        # Várunk, amíg az Angular teljesen felépíti a kártyákat a képernyőre
+        print("--> Várakozás a hirdetések betöltődésére...")
         page.wait_for_timeout(8000)
         
-        # Kivesszük a kész HTML-t
         html_content = page.content()
         soup = BeautifulSoup(html_content, 'html.parser')
         
-        # Keressük meg az összes linket, ami az árverési adatlapokra mutat
-        # (Pl: /arveres/123456 vagy hasonló struktúra)
+        # Kigyűjtjük az összes linket
         links = soup.find_all('a', href=True)
-        print(f"--> Összesen talált linkek száma az oldalon: {len(links)}")
+        print(f"--> Összesen talált nyers link: {len(links)}")
         
         for link_tag in links:
-            href = link_tag['href']
-            # Megnézzük, hogy a link egy árverési hirdetményre mutat-e
-            if "arveres" in href or "hirdetmeny" in href or "adatlap" in href:
-                text_content = link_tag.get_text(separator=" ", strip=True).lower()
+            href = str(link_tag['href'])
+            
+            # --- CRITICAL: Csak az MBVK belső részletes adatlapjait engedjük át! ---
+            # Kidobjuk a google, support, cookie és egyéb külső linkeket
+            if "google" in href or "support" in href or "cookie" in href or "javascript" in href:
+                continue
                 
-                # Próbáljuk megkeresni a szülő elemet (kártyát/sort), amiben az ár is benne van
+            # Az MBVK belső részletes linkjei általában 'reszletek', 'arveres' vagy konkrét azonosítót tartalmaznak a hash után
+            if "reszletek" in href or "arveres" in href or any(char.isdigit() for char in href):
+                
+                # Kiszedjük a tiszta számot (ID-t) a linkből
+                prop_id = ''.join(filter(str.isdigit, href))
+                if not prop_id or len(prop_id) < 4: # Ha nincs benne rendes azonosító, átugorjuk
+                    continue
+                    
                 parent = link_tag.find_parent(['div', 'tr', 'mat-card'])
                 parent_text = parent.get_text(separator=" ", strip=True) if parent else link_tag.get_text(strip=True)
                 
-                # Egyedi azonosító kinyerése a linkből
-                prop_id = ''.join(filter(str.isdigit, href))
-                if not prop_id:
-                    continue
-                    
-                # Ár kinyerése a szövegből (pl. "1 000 000" vagy "1.000.000")
+                # Ár kinyerése intelligensen
                 kikialtasi_ar = 0
                 clean_text = parent_text.replace(" ", "").replace(".", "").replace(",", "")
-                
-                # Keressük a számcsoportokat a tisztított szövegben
-                import re
                 szamok = re.findall(r'\d+', clean_text)
                 for szam in szamok:
-                    if len(szam) >= 6 and len(szam) <= 9: # Reális ingatlan árak (100.000 és 999.000.000 között)
-                        valaszthato_ar = int(szam)
-                        # Ha a szám után ott volt a 'ft' vagy 'huf' a szövegben, akkor ez lesz az ár
-                        if "ft" in clean_text or "huf" in clean_text:
-                            kikialtasi_ar = valaszthato_ar
-                            break
+                    if 6 <= len(szam) <= 9: # Reális ingatlan ár 100.000 és 999.000.000 Ft között
+                        kikialtasi_ar = int(szam)
+                        break
                 
-                # Település kinyerése (egyszerűsített verzió a szövegből)
-                telepules = "Részletek az adatlapon"
-                words = parent_text.split()
-                if len(words) > 0:
-                    telepules = " ".join(words[:4]) # Az első pár szó általában tartalmazza a helyszínt
+                # Település meghatározása a szöveg elejéből
+                telepules = "MBVK Ingatlan"
+                vonalak = [v.strip() for v in parent_text.split("\n") if v.strip()]
+                if vonalak:
+                    telepules = vonalak[0][:40] # Általában a kártya legelső sora a helyszín
 
-                full_link = href if href.startswith("http") else "https://arveres.mbvk.hu" + href
+                # Normalizáljuk a link formátumát
+                if href.startswith("#"):
+                    full_link = f"https://arveres.mbvk.hu/{href}"
+                elif href.startswith("/"):
+                    full_link = f"https://arveres.mbvk.hu{href}"
+                else:
+                    full_link = href
 
                 if not any(x['id'] == prop_id for x in arveresek):
                     arveresek.append({
@@ -111,11 +112,11 @@ def scrape_direct_url():
     return arveresek
 
 def main():
-    print("🚀 MBVK URL-Alapú Monitor elindult.")
+    print("🚀 MBVK Tisztított URL Monitor elindult.")
     old_records = load_database()
     
     properties = scrape_direct_url()
-    print(f"📊 Összesen feldolgozott releváns hirdetés: {len(properties)}")
+    print(f"📊 Talált valódi hirdetések száma szűrés után: {len(properties)}")
     
     new_found = False
     
@@ -124,7 +125,6 @@ def main():
         kikialtasi_ar = prop["ar"]
         
         # --- ÁR SZŰRÉS: Max 2 000 000 HUF ---
-        # Ha 0 maradt az ár (nem sikerült kivágni a szövegből), átengedjük, hogy ne maradj le róla!
         if kikialtasi_ar <= 2000000 or kikialtasi_ar == 0:
             if prop_id not in old_records:
                 new_found = True
@@ -134,16 +134,17 @@ def main():
                 
                 üzenet = (
                     f"🚨 *ÚJ MBVK INGATLAN TALÁLAT!*\n\n"
+                    f"📍 *Infó:* {prop['telepules']}\n"
                     f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
                     f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
                     f"🔗 [Ugrás az MBVK árverési adatlapra]({prop['link']})"
                 )
-                print(f"✨ Találat kiküldése: ID {prop_id}")
+                print(f"✨ Értesítés küldése: ID {prop_id}")
                 send_telegram_message(üzenet)
                 
     if new_found:
         save_database(old_records)
-        print("💾 Új rekordok elmentve.")
+        print("💾 Új rekordok sikeresen elmentve.")
     else:
         print("😴 Nem találtam a feltételeknek megfelelő új ingatlant.")
 
