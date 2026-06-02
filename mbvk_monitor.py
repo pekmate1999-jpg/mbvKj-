@@ -40,7 +40,6 @@ def main():
         )
         page = context.new_page()
 
-        # Megnyitjuk a keresőt
         target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
         print(f"--> URL megnyitása: {target_url}")
         
@@ -68,12 +67,10 @@ def main():
                     text_lower = text_content.lower()
 
                     # --- SZIGORÚ INGATLAN SZŰRÉS ---
-                    # Ha a szövegben benne van bármi, ami ingóságra utal, vagy NINCS benne az ingatlan/lakóház szó, eldobjuk
                     tiltott_szavak = ["ingóság", "személygépkocsi", "üzletrész", "ingóságok", "tehergépkocsi", "pótkocsi", "gép", "eszköz"]
                     if any(tiltott in text_lower for tiltott in tiltott_szavak):
                         continue
                     
-                    # Ha az oldal figyelmen kívül hagyta az URL szűrőt, itt manuálisan megköveteljük az ingatlan kulcsszót
                     if "ingatlan" not in text_lower and "lakóház" not in text_lower and "lakás" not in text_lower and "telek" not in text_lower:
                         continue
 
@@ -86,11 +83,10 @@ def main():
                             kikialtasi_ar = int(clean_word)
                             break
 
-                    # Intelligens helyszín keresés: Megkeressük az első olyan sort, ami nem ügyszám és nem üres
+                    # Intelligens helyszín keresés
                     telepules = "MBVK Ingatlan"
                     lines = [l.strip() for l in text_content.split("\n") if l.strip()]
                     for line in lines:
-                        # Ha a sor nem tartalmaz ügyszám formátumot (pl. .V. vagy /202) és nem csak számokból áll
                         if not re.search(r'\d+\.V\.\d+', line) and not line.replace(" ", "").isdigit() and len(line) > 3:
                             if "kikiáltási" not in line.lower() and "árverés" not in line.lower():
                                 telepules = line[:40]
@@ -139,7 +135,9 @@ def main():
         save_database(old_records)
         print("💾 Új találatok elmentve.")
     else:
-        print("😴 Nem találtam új, kritériumoknak megfelelő ingatlant.")
+        # --- ÚJ: Státuszjelentés küldése, ha nem volt új találat ---
+        print("😴 Nem találtam új hirdetést. Státusz üzenet küldése...")
+        send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott, de jelenleg nincs a feltételeknek megfelelő új 1/1-es ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
     main()
