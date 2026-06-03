@@ -1,220 +1,282 @@
 import os
-import json
-import requests
-import re
+import csv
 import html
-from datetime import datetime, timezone
+import sqlite3
+import logging
+import requests
+from datetime import datetime
 from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-DB_FILE = "mbvk_adatbazis.json"
+DB = "mbvk.db"
+LOG = "mbvk.log"
+CSV_EXPORT = "ingatlanok.csv"
 
-def load_database():
-    """Betölti az adatbázist, Set-ként tér vissza a villámgyors keresésért."""
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            try: 
-                return set(json.load(f))
-            except Exception: 
-                return set()
-    return set()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def save_database(data_set):
-    """Visszaalakítja listává a Set-et, és elmenti JSON-be."""
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(data_set), f, ensure_ascii=False, indent=4)
+TARGET_URL = "https://licitnaplo.hu/"
 
-def send_telegram_message(text):
-    """Elküldi az üzenetet HTML parse móddal, hogy elkerülje a Markdown-hibákat."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Hiányzó Telegram token vagy Chat ID!")
-        return
+logging.basicConfig(
+    filename=LOG,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": text, 
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
+
+class Storage:
+
+    def __init__(self):
+        self.conn = sqlite3.connect(DB)
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS properties(
+            id TEXT PRIMARY KEY,
+            url TEXT,
+            title TEXT,
+            price TEXT,
+            first_seen TEXT,
+            last_seen TEXT
+        )
+        """)
+        self.conn.commit()
+
+    def exists(self, pid):
+        cur = self.conn.execute(
+            "SELECT 1 FROM properties WHERE id=?",
+            (pid,)
+        )
+        return cur.fetchone() is not None
+
+    def add(self, pid, url, title, price):
+        now = datetime.now().isoformat()
+
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO properties
+            VALUES(?,?,?,?,?,?)
+            """,
+            (pid, url, title, price, now, now)
+        )
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
+def telegram(msg):
+
+    if not TOKEN or not CHAT_ID:
+        return False
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=30
+        )
+
+        return r.status_code == 200
+
+    except Exception as e:
+        logging.exception(e)
+        return False
+
+
+def export_csv(rows):
+
+    with open(CSV_EXPORT, "w", newline="", encoding="utf-8") as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "title",
+            "price",
+            "url"
+        ])
+
+        writer.writerows(rows)
+
+
+def scrape_property(page, url):
+
+    data = {
+        "title": "Ismeretlen",
+        "price": "N/A"
     }
-    
+
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
+
+        page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=30000
+        )
+
+        try:
+            data["title"] = page.locator("h1").first.inner_text()
+        except:
+            pass
+
+        body = page.inner_text("body")
+
+        for line in body.splitlines():
+            if "Ft" in line:
+                data["price"] = line.strip()
+                break
+
     except Exception as e:
-        print(f"❌ Telegram küldési hiba: {e}")
+        logging.exception(e)
 
-def get_property_details(page, url):
-    """Bejárja az adatlapot és robusztusan kinyeri a kért adatokat."""
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        
-        # 1. Strukturált JSON-LD adatok kinyerése a háttérből (Ár és Lejárat miatt)
-        structured_data = page.evaluate("""() => {
-            const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
-            let result = {};
-            for (const script of scripts) {
-                try {
-                    const json = JSON.parse(script.textContent);
-                    const objects = Array.isArray(json) ? json : [json];
-                    for (const obj of objects) {
-                        if (obj.offers && obj.offers.price) {
-                            result.price = obj.offers.price;
-                            result.validThrough = obj.offers.validThrough;
-                        }
-                        if (obj.name) {
-                            result.name = obj.name;
-                        }
-                    }
-                } catch (e) {}
-            }
-            return result;
-        }""")
-        
-        body_text = page.inner_text("body")
-        
-        # 2. Cím meghatározása és tisztítása (Ne legyen benne az, hogy "ingatlan árverés")
-        raw_title = structured_data.get("name")
-        if not raw_title:
-            h1_element = page.locator("h1").first
-            raw_title = h1_element.inner_text().strip() if h1_element.count() > 0 else url.split('/')[-1]
-        
-        # "Ingatlan árverés" kifejezések eltávolítása minden variációban
-        cim = raw_title
-        for word in ["Ingatlan Árverés", "ingatlan árverés", "Ingatlan árverés", "Árverés", "árverés"]:
-            cim = cim.replace(word, "")
-        cim = cim.strip(" -–—") # felesleges kötőjelek levágása a szélekről
+    return data
 
-        # 3. Kikiáltási ár formázása
-        price_val = structured_data.get("price")
-        if price_val:
-            ar = f"{int(price_val):,}".replace(",", " ") + " Ft"
+
+def collect_links(page):
+
+    page.goto(
+        TARGET_URL,
+        wait_until="domcontentloaded"
+    )
+
+    previous = 0
+    retries = 0
+
+    while True:
+
+        page.evaluate(
+            "window.scrollTo(0, document.body.scrollHeight)"
+        )
+
+        page.wait_for_timeout(1500)
+
+        links = page.evaluate(
+            "() => Array.from(document.querySelectorAll('a')).map(a=>a.href)"
+        )
+
+        links = [
+            x for x in links
+            if "/ingatlan/" in x
+        ]
+
+        current = len(set(links))
+
+        if current == previous:
+            retries += 1
+
+            if retries >= 3:
+                break
         else:
-            # Fallback megoldás, ha a struktúra sérült lenne: megkeressük a legelső "Ft" előtti számot
-            ar_match = re.search(r"([\d\s\xa0]+)\s*Ft", body_text)
-            ar = ar_match.group(0).strip() if ar_match else "Nincs megadva"
+            retries = 0
+            previous = current
 
-        # 4. Árverés vége és hátralévő napok kiszámítása
-        valid_through = structured_data.get("validThrough")
-        vege_idopont = "Nincs megadva"
-        hatralevo_napok = "Nincs adat"
-        
-        if valid_through:
-            try:
-                # ISO dátum formázása
-                end_date = datetime.fromisoformat(valid_through.replace("Z", "+00:00"))
-                vege_idopont = end_date.strftime("%Y.%m.%d. %H:%M")
-                
-                # Hátralévő idő kiszámítása a jelenlegi időhöz képest
-                now = datetime.now(timezone.utc)
-                diff = end_date - now
-                if diff.days > 0:
-                    hatralevo_napok = f"{diff.days} nap"
-                elif diff.days == 0:
-                    hatralevo_napok = "Ma jár le!"
-                else:
-                    hatralevo_napok = "Lejárt"
-            except Exception:
-                pass
+    return sorted(list(set(links)))
 
-        # 5. Telekméret kinyerése a szövegből (rugalmas regex szűréssel)
-        telekm_match = re.search(r"(?:Telekméret|Telek területe|Teleknagyság|Telek)[:\s]+([\d\s\xa0]+)\s*(?:nm|m2|m²|négyzetméter)", body_text, re.IGNORECASE)
-        telekméret = telekm_match.group(1).strip().replace("\xa0", " ") if telekm_match else "Nincs megadva"
-        
-        # 6. Leírás kinyerése és levágása
-        leiras_match = re.search(r"(?:Leírás|Megjegyzés)[:\s]+(.+?)(?:\n|$)", body_text, re.IGNORECASE)
-        leiras = leiras_match.group(1).strip() if leiras_match else "Nincs leírás."
-        if len(leiras) > 200:
-            leiras = leiras[:200] + "..."
-
-        return {
-            "cim": cim,
-            "ar": ar,
-            "telekméret": telekméret,
-            "leiras": leiras,
-            "vege": vege_idopont,
-            "hatralevo": hatralevo_napok
-        }
-        
-    except Exception as e:
-        print(f"⚠️ Hiba az adatlap olvasásakor ({url}): {e}")
-        return {"cim": "Hiba", "ar": "Hiba", "telekméret": "Hiba", "leiras": "Nem olvasható", "vege": "Hiba", "hatralevo": "Hiba"}
 
 def main():
-    old_records = load_database()
-    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&ar=0-1000000&epuletTipus=&besorolas=&forras=&status="
-    
+
+    telegram("🚀 MBVK PRO V3 indult")
+
+    db = Storage()
+
+    exported = []
+
+    stats = {
+        "new": 0,
+        "checked": 0,
+        "errors": 0
+    }
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        page = context.new_page()
-        
+
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox"]
+        )
+
+        ctx = browser.new_context()
+
         try:
-            page.goto(target_url, wait_until="networkidle", timeout=60000)
-            print("⏳ Találatok betöltése automatikus görgetéssel...")
-            
-            # --- ÚJ GÖRGETŐ LOGIKA ---
-            elozo_link_szam = 0
-            probalkozasok = 0
-            
-            while True:
-                # Görgessünk le az oldal legaljára
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                # Várjunk másfél másodpercet, amíg az oldal a háttérben betölti az új tételeket
-                page.wait_for_timeout(1500)
-                
-                # Jelenlegi linkek azonnali számlálása
-                links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
-                relevans_linkek = [l for l in links if "licitnaplo.hu/ingatlan/" in l]
-                jelenlegi_link_szam = len(set(relevans_linkek))
-                
-                # Ha nem nőtt a linkek száma az előző körhöz képest
-                if jelenlegi_link_szam == elozo_link_szam:
-                    probalkozasok += 1
-                    # Ha már 3-szor letekertünk és nem jött új, valószínűleg a lista végére értünk
-                    if probalkozasok >= 3: 
-                        break
-                else:
-                    probalkozasok = 0 # Ha van új, lenullázzuk a próbálkozást
-                    elozo_link_szam = jelenlegi_link_szam
-                    print(f"   Eddig betöltve: {jelenlegi_link_szam} db hirdetés...")
 
-            # --- VÉGE A GÖRGETÉSNEK ---
-            
-            # Most már a teljes oldal betöltött, kiszűrjük a konkrét egyedi linkeket
-            unique_links = list(set([l for l in relevans_linkek if not any(x in l for x in ["status=", "ar="])]))
-            print(f"✅ Végtelen görgetés befejezve! Összesen {len(unique_links)} db potenciális ingatlant találtam az oldalon.")
+            page = ctx.new_page()
 
-            for link in unique_links:
-                clean_id = "".join(filter(str.isalnum, link.split("/")[-1]))
-                
-                # Csak azt dolgozzuk fel, ami MÉG NINCS az adatbázisban
-                if clean_id in old_records: 
+            links = collect_links(page)
+
+            for url in links:
+
+                stats["checked"] += 1
+
+                pid = url
+
+                if db.exists(pid):
                     continue
-                
-                print(f"🔍 Új ingatlan feldolgozása: {link}")
-                details = get_property_details(page, link)
-                
-                maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(details['cim'])}"
-                
-                üzenet = (
-                    f"🏠 <b>Cím:</b> {html.escape(details['cim'])}\n"
-                    f"💰 <b>Kikiáltási ár:</b> {html.escape(details['ar'])}\n"
-                    f"📏 <b>Telekméret:</b> {html.escape(details['telekméret'])} nm\n"
-                    f"📅 <b>Árverés vége:</b> {html.escape(details['vege'])} (<b>{html.escape(details['hatralevo'])}</b>)\n"
-                    f"📝 <b>Leírás:</b> {html.escape(details['leiras'])}\n\n"
-                    f"🗺️ <a href='{maps_url}'>Megtekintés Google Maps-en</a>\n"
-                    f"🔗 <a href='{link}'>Ugrás az ingatlan adatlapjára</a>"
+
+                detail_page = ctx.new_page()
+
+                data = scrape_property(
+                    detail_page,
+                    url
                 )
-                
-                send_telegram_message(üzenet)
-                old_records.add(clean_id)
-                
+
+                detail_page.close()
+
+                db.add(
+                    pid,
+                    url,
+                    data["title"],
+                    data["price"]
+                )
+
+                exported.append([
+                    data["title"],
+                    data["price"],
+                    url
+                ])
+
+                maps = (
+                    "https://www.google.com/maps/search/?api=1&query="
+                    + quote_plus(data["title"])
+                )
+
+                telegram(
+                    f"🏠 <b>{html.escape(data['title'])}</b>\n\n"
+                    f"💰 {html.escape(data['price'])}\n\n"
+                    f"🗺️ <a href='{maps}'>Térkép</a>\n"
+                    f"🔗 <a href='{url}'>Adatlap</a>"
+                )
+
+                stats["new"] += 1
+
+            export_csv(exported)
+
         except Exception as e:
-            print(f"❌ Végzetes hiba futás közben: {e}")
+
+            stats["errors"] += 1
+
+            telegram(
+                f"❌ Hiba:\n{html.escape(str(e))}"
+            )
+
+            logging.exception(e)
+
         finally:
+
             browser.close()
-    
-    save_database(old_records)
+            db.close()
+
+    telegram(
+        f"📊 Összesítő\n\n"
+        f"Ellenőrzött: {stats['checked']}\n"
+        f"Új: {stats['new']}\n"
+        f"Hibák: {stats['errors']}"
+    )
+
+    if stats["new"] == 0:
+        telegram("✅ Nem találtam új ingatlant.")
+
+
+if __name__ == "__main__":
+    main()
