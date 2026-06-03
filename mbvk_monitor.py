@@ -30,10 +30,9 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 MBVK Finomhangolt Monitor elindult...")
+    print("🚀 MBVK Precíziós Helyszín Monitor elindult...")
     old_records = load_database()
     arveresek = []
-    debug_logs = []
 
     with sync_playwright() as p:
         print("--> Virtuális Chrome indítása...")
@@ -43,7 +42,7 @@ def main():
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 2000} # Megnövelt magasság
+            viewport={"width": 1280, "height": 2000}
         )
         page = context.new_page()
 
@@ -53,8 +52,7 @@ def main():
         page.goto(target_url, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(5000)
         
-        # --- LÉPCSŐZETES GÖRDÍTÉS A LAZY LOADING ELLEN ---
-        print("--> Lépcsőzetes görgetés az Angular tartalom kikényszerítéséhez...")
+        # Alapos görgetés a teljes tartalom betöltéséhez
         for i in range(4):
             page.evaluate(f"window.scrollTo(0, {i * 500});")
             page.wait_for_timeout(2000)
@@ -62,53 +60,58 @@ def main():
         page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
         page.wait_for_timeout(3000)
 
-        print("--> Szöveges tartalom kinyerése...")
         body_text = page.locator("body").inner_text()
         browser.close()
 
     if not body_text:
-        print("📭 Az oldal üres forrást adott vissza.")
+        print("📭 Az oldal üres.")
         return
 
     lines = [l.strip() for l in body_text.split("\n") if l.strip()]
     all_text_combined = " \n ".join(lines)
     
-    # Minden létező ügyszám formátum elkapása
     ugyszamok = list(set(re.findall(r'\d+\.V\.\d+(?:/\d+)?', all_text_combined)))
-    print(f"🔹 Talált nyers ügyszámok száma: {len(ugyszamok)}")
 
     for ugyszam in ugyszamok:
         try:
             auction_id = ugyszam.replace(".", "_").replace("/", "_")
-            telepules = "MBVK Ingatlan"
+            telepules = "Ismeretlen MBVK Helyszín"
             kikialtasi_ar = 0
             
             for i, line in enumerate(lines):
                 if ugyszam in line:
-                    # Szélesebb környezetvizsgálat (5 sor fel, 7 sor le)
+                    # Környezet vizsgálata
                     környezet = lines[max(0, i-5):min(len(lines), i+8)]
                     
-                    # --- ÁR BÁNYÁSZAT (Megengedőbb verzió) ---
+                    # 1. ÁR MEGHATÁROZÁSA
                     for k_line in környezet:
                         k_line_lower = k_line.lower()
-                        if any(x in k_line_lower for x in ["ft", "ár", "kikiáltási", "minimál", "becsérték"]):
+                        if "ft" in k_line_lower:
                             digits = "".join(filter(str.isdigit, k_line))
                             if digits and 50000 <= int(digits) <= 900000000:
-                                # Ha több szám is van, a legnagyobbat vesszük alapul az adott sorból (ez az ár)
-                                current_num = int(digits)
-                                if current_num > kikialtasi_ar:
-                                    kikialtasi_ar = current_num
+                                if int(digits) > kikialtasi_ar:
+                                    kikialtasi_ar = int(digits)
                     
-                    # --- HELYSZÍN BÁNYÁSZAT ---
+                    # 2. HELYSZÍN MEGHATÁROZÁSA (Szigorított szűrés a hibás szavak ellen)
                     for k_line in környezet:
-                        if (len(k_line) > 4 and 
-                            not re.search(r'\d{4}\.\d{2}\.\d{2}', k_line) and 
-                            not re.search(r'\d+\.V\.\d+', k_line) and 
-                            "ft" not in k_line.lower() and 
-                            "ügyszám" not in k_line.lower() and
-                            "licit" not in k_line.lower() and
-                            "érvényes" not in k_line.lower()):
-                            telepules = k_line
+                        k_line_clean = k_line.strip()
+                        k_line_lower = k_line_clean.lower()
+                        
+                        # Kizárjuk a technikai sorokat, árakat, ügyszámokat és sablonszövegeket
+                        if (len(k_line_clean) > 4 and 
+                            not re.search(r'\d{4}\.\d{2}\.\d{2}', k_line_clean) and 
+                            not re.search(r'\d+\.V\.\d+', k_line_clean) and 
+                            "ft" not in k_line_lower and 
+                            "ügyszám" not in k_line_lower and
+                            "licit" not in k_line_lower and
+                            "érvényes" not in k_line_lower and
+                            "ár" not in k_line_lower and 
+                            "becsérték" not in k_line_lower and
+                            "minimál" not in k_line_lower and
+                            "tulajdoni" not in k_line_lower and
+                            "sikeres" not in k_line_lower):
+                            
+                            telepules = k_line_clean
                             break
                     break
 
@@ -122,7 +125,6 @@ def main():
         except:
             continue
 
-    print(f"📊 Strukturált hirdetések száma: {len(arveresek)}")
     new_found_count = 0
 
     for prop in arveresek:
@@ -130,10 +132,6 @@ def main():
         kikialtasi_ar = prop["ar"]
         ugyszam = prop["ugyszam"]
 
-        # Gyűjtjük a belső infókat, hogy lássuk miért akad ki a szűrésen
-        debug_logs.append(f"• `{ugyszam}`: {kikialtasi_ar:,} Ft | DB-ben van: {auction_id in old_records}")
-
-        # Feltételek ellenőrzése
         if 0 < kikialtasi_ar <= 2000000:
             if auction_id not in old_records:
                 new_found_count += 1
@@ -149,16 +147,6 @@ def main():
                     f"🔗 [Megnyitás az MBVK Keresőben](https://arveres.mbvk.hu/#/kereses)"
                 )
                 send_telegram_message(üzenet)
-
-    # Ha élesben nem jött üzenet, küldünk egy diagnosztikai jelentést
-    if new_found_count == 0:
-        log_text = "\n".join(debug_logs[:10]) # Csak az első 10-et küldjük el, ne legyen hosszú
-        diagnosztika = (
-            f"ℹ️ *MBVK Diagnosztika*\n"
-            f"A keresés lefutott, de nem történt riasztás. Ezt látta a bot:\n\n"
-            f"{log_text if log_text else 'Nem talált egyetlen ügyszámot sem az oldalon!'}"
-        )
-        send_telegram_message(diagnosztika)
 
     if new_found_count > 0:
         save_database(old_records)
