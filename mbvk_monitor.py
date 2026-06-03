@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import html
 import sqlite3
 import requests
@@ -25,29 +26,28 @@ COUNTIES = [
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-
 class DB:
     def __init__(self):
-        self.conn = sqlite3.connect("mbvk_v5.db")
+        self.conn = sqlite3.connect("mbvk_v6.db")
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS properties(
-            url TEXT PRIMARY KEY,
+            auction_id TEXT PRIMARY KEY,
             created TEXT
         )
         """)
         self.conn.commit()
 
-    def exists(self, url):
+    def exists(self, auction_id):
         cur = self.conn.execute(
-            "SELECT 1 FROM properties WHERE url=?",
-            (url,)
+            "SELECT 1 FROM properties WHERE auction_id=?",
+            (auction_id,)
         )
         return cur.fetchone() is not None
 
-    def add(self, url):
+    def add(self, auction_id):
         self.conn.execute(
             "INSERT OR REPLACE INTO properties VALUES(?,?)",
-            (url, datetime.now().isoformat())
+            (auction_id, datetime.now().isoformat())
         )
         self.conn.commit()
 
@@ -71,73 +71,26 @@ def telegram(msg):
     )
 
 
-def extract_price(text):
-    matches = re.findall(r'([\d\s\xa0]+)\s*Ft', text)
-    for m in matches:
-        try:
-            return int(m.replace(" ", "").replace("\xa0", ""))
-        except:
-            pass
-    return None
-
-
-def extract_land_size(text):
-
-    patterns = [
-        r'([\d\s]+)\s*m²',
-        r'([\d\s]+)\s*m2',
-        r'([\d\s]+)\s*nm',
-        r'Telekméret[:\s]+([\d\s]+)',
-        r'Telek területe[:\s]+([\d\s]+)'
-    ]
-
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            try:
-                return int(
-                    m.group(1)
-                    .replace(" ", "")
-                    .replace("\xa0", "")
-                )
-            except:
-                pass
-
-    return None
-
-
 def allowed_county(text):
     text = text.lower()
     return any(c in text for c in COUNTIES)
 
 
 def collect_links(page):
-
-    page.goto(
-        TARGET_URL,
-        wait_until="domcontentloaded",
-        timeout=60000
-    )
+    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
 
     prev = 0
     same = 0
 
     while True:
-
-        page.evaluate(
-            "window.scrollTo(0, document.body.scrollHeight)"
-        )
-
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1500)
 
         links = page.evaluate(
             "() => Array.from(document.querySelectorAll('a')).map(a=>a.href)"
         )
 
-        links = [
-            x for x in links
-            if "/ingatlan/" in x
-        ]
+        links = [x for x in links if "/ingatlan/" in x]
 
         current = len(set(links))
 
@@ -152,26 +105,93 @@ def collect_links(page):
     return sorted(list(set(links)))
 
 
+def extract_json_data(page):
+    scripts = page.locator("script[type='application/ld+json']")
+
+    for i in range(scripts.count()):
+        try:
+            txt = scripts.nth(i).inner_text()
+
+            if "arveresId" in txt:
+                return json.loads(txt)
+        except:
+            pass
+
+    content = page.content()
+
+    patterns = [
+        r'"arveresId"\s*:\s*(\d+)',
+        r'"kikialtasiAr"\s*:\s*(\d+)',
+    ]
+
+    result = {}
+
+    for p in patterns:
+        m = re.search(p, content)
+        if m:
+            result[p] = m.group(1)
+
+    return result
+
+
 def scrape(page, url):
 
-    page.goto(
-        url,
-        wait_until="domcontentloaded",
-        timeout=30000
-    )
-
-    try:
-        title = page.locator("h1").first.inner_text()
-    except:
-        title = url
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
     body = page.inner_text("body")
 
+    title = ""
+
+    try:
+        title = page.locator("h1").first.inner_text().strip()
+    except:
+        title = url
+
+    title = re.sub(
+        r'^Ingatlan\s+árverés\s+',
+        '',
+        title,
+        flags=re.IGNORECASE
+    )
+
+    json_data = extract_json_data(page)
+
+    auction_id = None
+
+    m = re.search(r'"arveresId"\s*:\s*(\d+)', page.content())
+    if m:
+        auction_id = m.group(1)
+
+    price = None
+    m = re.search(r'"kikialtasiAr"\s*:\s*(\d+)', page.content())
+    if m:
+        price = int(m.group(1))
+
+    land_size = None
+
+    land_patterns = [
+        r'Telekméret[:\s]+([\d\s]+)',
+        r'Telek területe[:\s]+([\d\s]+)',
+        r'([\d\s]+)\s*m²'
+    ]
+
+    for p in land_patterns:
+        m = re.search(p, body, re.IGNORECASE)
+        if m:
+            try:
+                land_size = int(
+                    m.group(1).replace(" ", "")
+                )
+                break
+            except:
+                pass
+
     return {
+        "auction_id": auction_id,
         "title": title,
         "body": body,
-        "price": extract_price(body),
-        "land_size": extract_land_size(body)
+        "price": price,
+        "land_size": land_size
     }
 
 
@@ -179,9 +199,9 @@ def main():
 
     db = DB()
 
-    stats_new = 0
+    new_count = 0
 
-    telegram("🚀 MBVK V5 futás indult")
+    telegram("🚀 MBVK V6 futás indult")
 
     with sync_playwright() as p:
 
@@ -198,14 +218,17 @@ def main():
 
         for url in links:
 
-            if db.exists(url):
-                continue
-
             detail = ctx.new_page()
 
             try:
 
                 data = scrape(detail, url)
+
+                if not data["auction_id"]:
+                    continue
+
+                if db.exists(data["auction_id"]):
+                    continue
 
                 if not data["price"]:
                     continue
@@ -219,10 +242,7 @@ def main():
                 sqm_price = "N/A"
 
                 if data["land_size"] and data["land_size"] > 0:
-                    sqm = round(
-                        data["price"] / data["land_size"]
-                    )
-                    sqm_price = f"{sqm:,} Ft/m²"
+                    sqm_price = f"{round(data['price']/data['land_size']):,} Ft/m²"
 
                 maps_url = (
                     "https://www.google.com/maps/search/?api=1&query="
@@ -238,18 +258,18 @@ def main():
                     f"🔗 <a href='{url}'>Adatlap</a>"
                 )
 
-                db.add(url)
-                stats_new += 1
+                db.add(data["auction_id"])
+                new_count += 1
 
             finally:
                 detail.close()
 
         browser.close()
 
-    if stats_new == 0:
+    if new_count == 0:
         telegram("✅ Nem találtam új, feltételeknek megfelelő ingatlant.")
 
-    telegram(f"📊 Futás vége. Új találatok: {stats_new}")
+    telegram(f"📊 MBVK V6 futás vége. Új találatok: {new_count}")
 
 
 if __name__ == "__main__":
