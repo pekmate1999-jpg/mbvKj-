@@ -96,7 +96,9 @@ def send_telegram_message(text):
 def main():
     print("🚀 Licitnapló Távirányítós Szövegbányász Monitor elindult...")
     old_records = load_database()
-    
+# A GitHubon a 'print' logok segítenek látni, mi történik
+print(f"DEBUG: Jelenlegi adatbázis mérete: {len(old_records)} tétel.")
+
     # Konfiguráció betöltése (Telegram vezérlés)
     config = load_and_update_config()
     print(f"🔍 Aktív szűrés -> Kulcsszó: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
