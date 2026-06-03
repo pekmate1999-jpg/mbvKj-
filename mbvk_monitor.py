@@ -158,7 +158,6 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def get_links_data(page):
-    """Kinyeri az összes linket és szöveget a DOM-ból."""
     return page.evaluate("""() => {
         const links = Array.from(document.querySelectorAll('a'));
         return links.map(a => ({
@@ -166,56 +165,3 @@ def get_links_data(page):
             text: a.innerText || ""
         }));
     }""")
-
-def count_valid_items(links_data):
-    """Gyors ellenőrzés, hány releváns ingatlan linket látunk jelenleg."""
-    count = 0
-    for item in links_data:
-        text = item.get("text", "").lower()
-        href = item.get("href", "")
-        if "ft" in text and "licitnaplo.hu/" in href and not any(x in href for x in ["status=", "ar=", "bekoltozheto=", "oldal=", "rendezes="]):
-            count += 1
-    return count
-
-def main():
-    print("🚀 Licitnapló Szövegbányász Monitor elindult...")
-    old_records = load_database()
-    
-    config = load_and_update_config()
-    print(f"🔍 Aktív szűrés -> Csoport: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
-    
-    target_url = f"https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-{config['max_ar']}&status=aktiv"
-    
-    links_data = []
-    
-    with sync_playwright() as p:
-        try:
-            print("--> Virtuális Chrome indítása...")
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 3000}
-            )
-            page = context.new_page()
-            
-            print(f"--> Oldal betöltése: {target_url}")
-            page.goto(target_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(4000)
-            
-            print("--> Intelligens adaptív mélygörgetés az összes találat begyűjtéséhez...")
-            
-            previous_count = 0
-            retries = 0
-            max_retries = 4 # Hányszor próbálkozzon, ha nem nőtt a találatok száma
-            
-            for i in range(50): # Maximum 50 lépést engedünk
-                # Lépcsőzetes görgetés, hogy az animációknak legyen ideje reagálni
-                page.evaluate("window.scrollBy(0, 2000);")
-                page.wait_for_timeout(1000)
-                page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
-                page.wait_for_timeout(1500)
-                
-                current_links = get_links_data(page)
-                current_count = count_valid_items(current_links)
-                
-                print(f"
