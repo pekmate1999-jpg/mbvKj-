@@ -8,10 +8,6 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DB_FILE = "mbvk_adatbazis.json"
 
-# === ÉLES ÜZEMMÓD ===
-# Kikapcsolva a teszt, mostantól CSAK a 2M Ft alatti új ingatlanoknál fog riasztani!
-TESZT_MOD = False 
-
 def load_database():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -26,12 +22,16 @@ def save_database(data):
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        res = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        print(f"📡 Telegram küldés státusz: {res.status_code}")
     except Exception as e:
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 MBVK Éles Monitor elindult...")
+    print("🚀 MBVK Debug Monitor elindult...")
+    # 1. TESZT: Küldünk egy azonnali jelet a Telegramra, hogy él-e a kapcsolat
+    send_telegram_message("🤖 *MBVK Monitor:* A futás elindult, megkezdem az oldal beolvasását...")
+
     old_records = load_database()
     arveresek = []
 
@@ -47,31 +47,42 @@ def main():
         )
         page = context.new_page()
 
-        # ÉLES, SZIGORÚAN SZŰRT URL (1/1, beköltözhető, tehermentes ingatlanok)
         target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
         print(f"--> URL megnyitása: {target_url}")
         
-        page.goto(target_url, wait_until="networkidle", timeout=60000)
-        
-        print("--> Várakozás a dinamikus tartalom generálódására...")
-        page.wait_for_timeout(8000)
-        
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-        page.wait_for_timeout(4000)
-
-        print("--> Szöveges tartalom kinyerése...")
-        body_text = page.locator("body").inner_text()
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            print("--> Oldal alapvetően betöltődött. Várunk a JavaScriptre (10 mp)...")
+            page.wait_for_timeout(10000)
+            
+            # Kényszerített görgetés, hogy az Angular felébredjen
+            page.evaluate("window.scrollTo(0, 300);")
+            page.wait_for_timeout(3000)
+            
+            print("--> Szöveges tartalom kinyerése...")
+            body_text = page.locator("body").inner_text()
+            
+            print(f"📝 Kinyert szöveg hossza: {len(body_text) if body_text else 0} karakter.")
+            
+            if not body_text or len(body_text.strip()) < 100:
+                print("⚠️ A kinyert szöveg túl rövid vagy üres! Képernyőkép mentése...")
+                page.screenshot(path="screenshot.png")
+                send_telegram_message("⚠️ *MBVK Monitor:* Az oldal szövege üresen jött vissza. Mentettem egy `screenshot.png`-t a munkafolyamatba.")
+                
+        except Exception as e:
+            print(f"❌ Hiba a Playwright futása közben: {e}")
+            page.screenshot(path="error_screenshot.png")
+            body_text = ""
         
         browser.close()
 
     if not body_text:
-        print("📭 Az oldal üres forrást adott vissza.")
+        print("📭 Nincs feldolgozható szöveg, leállás.")
         return
 
     lines = [l.strip() for l in body_text.split("\n") if l.strip()]
     all_text_combined = " \n ".join(lines)
     
-    # Ügyszámok kikeresése
     ugyszamok = list(set(re.findall(r'\d+\.V\.\d+(?:/\d+)?', all_text_combined)))
     print(f"🔹 Talált egyedi ügyszámok száma: {len(ugyszamok)}")
 
@@ -85,7 +96,6 @@ def main():
                 if ugyszam in line:
                     környezet = lines[max(0, i-4):min(len(lines), i+6)]
                     
-                    # Ár bányászat
                     for k_line in környezet:
                         if "ft" in k_line.lower() or "kikiáltási" in k_line.lower() or "minimál" in k_line.lower():
                             digits = "".join(filter(str.isdigit, k_line))
@@ -93,7 +103,6 @@ def main():
                                 kikialtasi_ar = int(digits)
                                 break
                     
-                    # Település bányászat
                     for k_line in környezet:
                         if (len(k_line) > 4 and 
                             not re.search(r'\d{4}\.\d{2}\.\d{2}', k_line) and 
@@ -117,38 +126,36 @@ def main():
         except:
             continue
 
+    print(f"📊 Strukturált ingatlanok száma: {len(arveresek)}")
     new_found_count = 0
 
     for prop in arveresek:
         auction_id = prop["id"]
         kikialtasi_ar = prop["ar"]
 
-        # Szigorú szűrés: Csak a 2 millió Ft alattiak és csak az újak!
         if kikialtasi_ar <= 2000000 and kikialtasi_ar > 0:
             if auction_id not in old_records:
                 new_found_count += 1
                 old_records.append(auction_id)
 
                 ar_kiiras = f"{kikialtasi_ar:,} HUF"
-
-                # `ügyszám` -> Monospace formázás. Mobilról rákattintva AZONNAL vágólapra másolja!
                 üzenet = (
                     f"🚨 *ÚJ OLCSÓ INGATLAN TALÁLAT!*\n\n"
                     f"📍 *Helyszín:* {prop['telepules']}\n"
                     f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
                     f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n"
-                    f"🔹 *Másolható ügyszám (kattints rá):* `{prop['ugyszam']}`\n\n"
+                    f"🔹 *Másolható ügyszám:* `{prop['ugyszam']}`\n\n"
                     f"🔗 [Megnyitás az MBVK Keresőben](https://arveres.mbvk.hu/#/kereses)"
                 )
-                
                 send_telegram_message(üzenet)
 
     if new_found_count > 0:
         save_database(old_records)
-        print(f"💾 {new_found_count} új ingatlan elmentve az adatbázisba.")
+        print(f"💾 {new_found_count} új ingatlan elmentve.")
     else:
-        print("😴 Nincs új, feltételeknek megfelelő olcsó ingatlan.")
-
+        print("😴 Nincs új találat.")
+        # Ezt most visszatesszük, hogy lássuk, eljut-e a kód a legvégéig hiba nélkül
+        send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott, de jelenleg nincs a feltételeknek megfelelő új ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
     main()
