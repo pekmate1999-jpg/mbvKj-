@@ -3,6 +3,7 @@ import json
 import requests
 import re
 import html
+from datetime import datetime, timezone
 from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
@@ -36,7 +37,7 @@ def send_telegram_message(text):
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": text, 
         "parse_mode": "HTML",
-        "disable_web_page_preview": True # Ne generáljon zavaró méretű link-előnézetet
+        "disable_web_page_preview": True
     }
     
     try:
@@ -50,31 +51,80 @@ def get_property_details(page, url):
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         
-        raw_html = page.content()
+        # 1. Strukturált JSON-LD adatok kinyerése a háttérből (Ár és Lejárat miatt)
+        structured_data = page.evaluate("""() => {
+            const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+            let result = {};
+            for (const script of scripts) {
+                try {
+                    const json = JSON.parse(script.textContent);
+                    const objects = Array.isArray(json) ? json : [json];
+                    for (const obj of objects) {
+                        if (obj.offers && obj.offers.price) {
+                            result.price = obj.offers.price;
+                            result.validThrough = obj.offers.validThrough;
+                        }
+                        if (obj.name) {
+                            result.name = obj.name;
+                        }
+                    }
+                } catch (e) {}
+            }
+            return result;
+        }""")
+        
         body_text = page.inner_text("body")
         
-        # 1. Cím kinyerése (Első körben H1 címsor, ha nincs, akkor URL-ből)
-        cim = "Ismeretlen ingatlan"
-        h1_element = page.locator("h1").first
-        if h1_element.count() > 0:
-            cim = h1_element.inner_text().strip()
-        else:
-            cim = url.split('/')[-1].replace('-', ' ').title()
-
-        # 2. Kikiáltási ár kinyerése a rejtett strukturált (JSON-LD) adatokból
-        ar = "Új találat (Ár nem olvasható)"
-        price_match = re.search(r'"price"\s*:\s*(\d+)', raw_html)
-        if price_match:
-            # Szám formázása, pl: 1200000 -> 1 200 000 Ft
-            formazott_ar = f"{int(price_match.group(1)):,} Ft".replace(",", " ")
-            ar = formazott_ar
-
-        # 3. Régi regex keresések a body_text-en
-        telekm_match = re.search(r"(?:Telekméret|Telek területe|Teleknagyság)[:\s]+([\d\s]+)\s*(?:nm|m2|négyzetméter)", body_text, re.IGNORECASE)
-        leiras_match = re.search(r"(?:Leírás|Megjegyzés)[:\s]+(.+?)(?:\n|$)", body_text, re.IGNORECASE)
-        nm_ar_match = re.search(r"(?:Négyzetméterár|Ft/m2)[:\s]+([\d\s]+)\s*Ft", body_text, re.IGNORECASE)
+        # 2. Cím meghatározása és tisztítása (Ne legyen benne az, hogy "ingatlan árverés")
+        raw_title = structured_data.get("name")
+        if not raw_title:
+            h1_element = page.locator("h1").first
+            raw_title = h1_element.inner_text().strip() if h1_element.count() > 0 else url.split('/')[-1]
         
-        # Leírás levágása 200 karakternél (hogy ne spammelje tele a Telegramot)
+        # "Ingatlan árverés" kifejezések eltávolítása minden variációban
+        cim = raw_title
+        for word in ["Ingatlan Árverés", "ingatlan árverés", "Ingatlan árverés", "Árverés", "árverés"]:
+            cim = cim.replace(word, "")
+        cim = cim.strip(" -–—") # felesleges kötőjelek levágása a szélekről
+
+        # 3. Kikiáltási ár formázása
+        price_val = structured_data.get("price")
+        if price_val:
+            ar = f"{int(price_val):,}".replace(",", " ") + " Ft"
+        else:
+            # Fallback megoldás, ha a struktúra sérült lenne: megkeressük a legelső "Ft" előtti számot
+            ar_match = re.search(r"([\d\s\xa0]+)\s*Ft", body_text)
+            ar = ar_match.group(0).strip() if ar_match else "Nincs megadva"
+
+        # 4. Árverés vége és hátralévő napok kiszámítása
+        valid_through = structured_data.get("validThrough")
+        vege_idopont = "Nincs megadva"
+        hatralevo_napok = "Nincs adat"
+        
+        if valid_through:
+            try:
+                # ISO dátum formázása
+                end_date = datetime.fromisoformat(valid_through.replace("Z", "+00:00"))
+                vege_idopont = end_date.strftime("%Y.%m.%d. %H:%M")
+                
+                # Hátralévő idő kiszámítása a jelenlegi időhöz képest
+                now = datetime.now(timezone.utc)
+                diff = end_date - now
+                if diff.days > 0:
+                    hatralevo_napok = f"{diff.days} nap"
+                elif diff.days == 0:
+                    hatralevo_napok = "Ma jár le!"
+                else:
+                    hatralevo_napok = "Lejárt"
+            except Exception:
+                pass
+
+        # 5. Telekméret kinyerése a szövegből (rugalmas regex szűréssel)
+        telekm_match = re.search(r"(?:Telekméret|Telek területe|Teleknagyság|Telek)[:\s]+([\d\s\xa0]+)\s*(?:nm|m2|m²|négyzetméter)", body_text, re.IGNORECASE)
+        telekméret = telekm_match.group(1).strip().replace("\xa0", " ") if telekm_match else "Nincs megadva"
+        
+        # 6. Leírás kinyerése és levágása
+        leiras_match = re.search(r"(?:Leírás|Megjegyzés)[:\s]+(.+?)(?:\n|$)", body_text, re.IGNORECASE)
         leiras = leiras_match.group(1).strip() if leiras_match else "Nincs leírás."
         if len(leiras) > 200:
             leiras = leiras[:200] + "..."
@@ -82,14 +132,15 @@ def get_property_details(page, url):
         return {
             "cim": cim,
             "ar": ar,
-            "telekméret": telekm_match.group(1).strip() if telekm_match else "Nincs megadva",
+            "telekméret": telekméret,
             "leiras": leiras,
-            "nm_ar": nm_ar_match.group(1).strip() if nm_ar_match else "N/A"
+            "vege": vege_idopont,
+            "hatralevo": hatralevo_napok
         }
         
     except Exception as e:
         print(f"⚠️ Hiba az adatlap olvasásakor ({url}): {e}")
-        return {"cim": "Hiba", "ar": "Hiba", "telekméret": "Hiba", "leiras": "Nem olvasható", "nm_ar": "N/A"}
+        return {"cim": "Hiba", "ar": "Hiba", "telekméret": "Hiba", "leiras": "Nem olvasható", "vege": "Hiba", "hatralevo": "Hiba"}
 
 def main():
     old_records = load_database()
@@ -110,22 +161,21 @@ def main():
             for link in unique_links:
                 clean_id = "".join(filter(str.isalnum, link.split("/")[-1]))
                 
-                # Ugrás a következőre, ha már láttuk
                 if clean_id in old_records: 
                     continue
                 
                 print(f"🔍 Új ingatlan feldolgozása: {link}")
                 details = get_property_details(page, link)
                 
-                # Cím keresése Google Térképen (hivatalos Google Maps Search API paraméterezés)
+                # Google Maps kereső link generálása a tiszta címmel
                 maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(details['cim'])}"
                 
-                # Vizuálisan megegyezik a képernyőfotóddal, de HTML (<b> tag) alapon megy, ami bombabiztos
+                # Telegram üzenet összeállítása a kért adatokkal
                 üzenet = (
                     f"🏠 <b>Cím:</b> {html.escape(details['cim'])}\n"
                     f"💰 <b>Kikiáltási ár:</b> {html.escape(details['ar'])}\n"
                     f"📏 <b>Telekméret:</b> {html.escape(details['telekméret'])} nm\n"
-                    f"💵 <b>Négyzetméterár:</b> {html.escape(details['nm_ar'])} Ft/nm\n"
+                    f"📅 <b>Árverés vége:</b> {html.escape(details['vege'])} (<b>{html.escape(details['hatralevo'])}</b>)\n"
                     f"📝 <b>Leírás:</b> {html.escape(details['leiras'])}\n\n"
                     f"🗺️ <a href='{maps_url}'>Megtekintés Google Maps-en</a>\n"
                     f"🔗 <a href='{link}'>Ugrás az ingatlan adatlapjára</a>"
