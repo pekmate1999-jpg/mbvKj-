@@ -16,7 +16,6 @@ def load_database():
         with open(DB_FILE, "r", encoding="utf-8") as f:
             try:
                 data = json.load(f)
-                # Ha véletlenül szótár (dict) mentődött el, a kulcsok a mentett ID-k
                 if isinstance(data, dict):
                     return list(data.keys())
                 return data if isinstance(data, list) else []
@@ -30,15 +29,16 @@ def save_database(data):
 
 def kinyer_extra_infok(szoveg, kikialtasi_ar):
     """
-    Kibányássza a szövegből a méretet, minimálárat és aktuális licitet,
-    valamint kiszámolja a négyzetméterárat.
+    Kibányássza a szövegből a méretet, minimálárat és aktuális licitet.
+    Ha nem találja, None értéket ad vissza, így elrejthető az üzenetből.
     """
-    szoveg_low = szoveg.lower()
+    szoveg_clean = re.sub(r'\s+', ' ', szoveg.replace('\xa0', ' ')).strip()
+    szoveg_low = szoveg_clean.lower()
     
-    # 1. Alapterület / Telekméret keresése
-    meret_match = re.search(r'(\d+[\d\s]*)\s*(m²|m2|nm)', szoveg_low)
+    # 1. Alapterület / Telekméret keresése (ha esetleg mégis szerepelne a főoldalon)
+    meret_match = re.search(r'(\d+[\d\s]*)\s*(m²|m2|nm|négyzetméter|negyzetmeter)', szoveg_low)
     size_num = None
-    telekmeret = "Nincs információ"
+    telekmeret = None
     if meret_match:
         try:
             clean_size = "".join(filter(str.isdigit, meret_match.group(1)))
@@ -48,12 +48,12 @@ def kinyer_extra_infok(szoveg, kikialtasi_ar):
         except Exception:
             pass
         
-    minimal_ar = "Nincs megadva"
-    aktualis_licit = "Nincs aktív licit"
+    minimal_ar = None
+    aktualis_licit = None
     
     # 2. Soronkénti elemzés a kulcsszavakhoz
     for line in szoveg.split("\n"):
-        l_low = line.lower().strip()
+        l_low = line.lower().replace('\xa0', ' ').strip()
         if any(x in l_low for x in ["minimál", "minimal", "min.ár", "minimum"]):
             digits = "".join(filter(str.isdigit, l_low))
             if digits:
@@ -65,7 +65,7 @@ def kinyer_extra_infok(szoveg, kikialtasi_ar):
                     aktualis_licit = f"{int(digits):,} HUF"
                     
     # 3. Négyzetméterár kiszámítása
-    nm_ar = "Nem számítható"
+    nm_ar = None
     if size_num and size_num > 0 and kikialtasi_ar > 0:
         nm_ar = f"{round(kikialtasi_ar / size_num):,} HUF/m²"
         
@@ -213,7 +213,6 @@ def main():
                 telepules = lines[0]
                 cim = lines[1] if len(lines) > 1 and "Ft" not in lines[1] else telepules
                 
-                # ID generálása perjelek levágásával, hogy a -1 index ne legyen üres
                 clean_id = "".join(filter(str.isalnum, href.strip("/").split("/")[-1]))
                 if not clean_id:
                     clean_id = "".join(filter(str.isalnum, cim))[:20] + f"_{kikialtasi_ar}"
@@ -291,22 +290,27 @@ def main():
             keresendo_cim = f"{prop['telepules']} {prop['cim']}".replace("...", "").strip()
             maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(keresendo_cim)}"
 
-            kategoria_nev = config['keyword'].upper()
-            max_ar_formazott = f"{config['max_ar']:,} Ft"
+            # Dinamikus üzenetépítés a kért, egyszerűsített új fejléccel
+            msg_lines = [
+                f"🚨 *ÚJ TALÁLAT*\n",
+                f"📍 *Település:* {prop['telepules']}",
+                f"🏠 *Cím:* {prop['cim']}",
+                f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF"
+            ]
+            
+            if prop['aktualis_licit']:
+                msg_lines.append(f"📈 *Aktuális licit:* {prop['aktualis_licit']}")
+            if prop['minimal_ar']:
+                msg_lines.append(f"📉 *Minimum ár:* {prop['minimal_ar']}")
+            if prop['telekmeret']:
+                msg_lines.append(f"📐 *Alapterület:* {prop['telekmeret']}")
+            if prop['nm_ar']:
+                msg_lines.append(f"🧮 *Négyzetméterár:* {prop['nm_ar']}")
+                
+            msg_lines.append(f"\n🗺️ [Megtekintés Google Maps-en]({maps_url})")
+            msg_lines.append(f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})")
 
-            # Kiegészítve a hiányzó extra adatokkal
-            üzenet = (
-                f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* (`{kategoria_nev}` | `{max_ar_formazott}` alatt)\n\n"
-                f"📍 *Település:* {prop['telepules']}\n"
-                f"🏠 *Cím:* {prop['cim']}\n"
-                f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
-                f"📈 *Aktuális licit:* {prop['aktualis_licit']}\n"
-                f"📉 *Minimum ár:* {prop['minimal_ar']}\n"
-                f"📐 *Telekméret / Alapterület:* {prop['telekmeret']}\n"
-                f"🧮 *Négyzetméterár:* {prop['nm_ar']}\n\n"
-                f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
-                f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
-            )
+            üzenet = "\n".join(msg_lines)
             send_telegram_message(üzenet)
 
     if new_found_count > 0:
