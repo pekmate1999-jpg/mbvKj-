@@ -15,7 +15,11 @@ def load_database():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
             try:
-                return json.load(f)
+                data = json.load(f)
+                # HA VÉLETLENÜL SZÓTÁR (DICT) LENNE, ÁTALAKÍTJUK LISTÁVÁ
+                if isinstance(data, dict):
+                    return list(data.keys())
+                return data if isinstance(data, list) else []
             except:
                 return []
     return []
@@ -286,7 +290,6 @@ def main():
             keresendo_cim = f"{prop['telepules']} {prop['cim']}".replace("...", "").strip()
             maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(keresendo_cim)}"
 
-            # Itt javítottam ki a behúzást (szigorúan a cikluson belülre kerültek a sorok):
             kategoria_nev = config['keyword'].upper()
             max_ar_formazott = f"{config['max_ar']:,} Ft"
 
