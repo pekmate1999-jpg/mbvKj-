@@ -153,24 +153,52 @@ def main():
         
         try:
             page.goto(target_url, wait_until="networkidle", timeout=60000)
+            print("⏳ Találatok betöltése automatikus görgetéssel...")
             
-            # Releváns linkek begyűjtése
-            links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
-            unique_links = list(set([l for l in links if "licitnaplo.hu/ingatlan/" in l and not any(x in l for x in ["status=", "ar="])]))
+            # --- ÚJ GÖRGETŐ LOGIKA ---
+            elozo_link_szam = 0
+            probalkozasok = 0
+            
+            while True:
+                # Görgessünk le az oldal legaljára
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                # Várjunk másfél másodpercet, amíg az oldal a háttérben betölti az új tételeket
+                page.wait_for_timeout(1500)
+                
+                # Jelenlegi linkek azonnali számlálása
+                links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
+                relevans_linkek = [l for l in links if "licitnaplo.hu/ingatlan/" in l]
+                jelenlegi_link_szam = len(set(relevans_linkek))
+                
+                # Ha nem nőtt a linkek száma az előző körhöz képest
+                if jelenlegi_link_szam == elozo_link_szam:
+                    probalkozasok += 1
+                    # Ha már 3-szor letekertünk és nem jött új, valószínűleg a lista végére értünk
+                    if probalkozasok >= 3: 
+                        break
+                else:
+                    probalkozasok = 0 # Ha van új, lenullázzuk a próbálkozást
+                    elozo_link_szam = jelenlegi_link_szam
+                    print(f"   Eddig betöltve: {jelenlegi_link_szam} db hirdetés...")
+
+            # --- VÉGE A GÖRGETÉSNEK ---
+            
+            # Most már a teljes oldal betöltött, kiszűrjük a konkrét egyedi linkeket
+            unique_links = list(set([l for l in relevans_linkek if not any(x in l for x in ["status=", "ar="])]))
+            print(f"✅ Végtelen görgetés befejezve! Összesen {len(unique_links)} db potenciális ingatlant találtam az oldalon.")
 
             for link in unique_links:
                 clean_id = "".join(filter(str.isalnum, link.split("/")[-1]))
                 
+                # Csak azt dolgozzuk fel, ami MÉG NINCS az adatbázisban
                 if clean_id in old_records: 
                     continue
                 
                 print(f"🔍 Új ingatlan feldolgozása: {link}")
                 details = get_property_details(page, link)
                 
-                # Google Maps kereső link generálása a tiszta címmel
                 maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(details['cim'])}"
                 
-                # Telegram üzenet összeállítása a kért adatokkal
                 üzenet = (
                     f"🏠 <b>Cím:</b> {html.escape(details['cim'])}\n"
                     f"💰 <b>Kikiáltási ár:</b> {html.escape(details['ar'])}\n"
@@ -190,6 +218,3 @@ def main():
             browser.close()
     
     save_database(old_records)
-
-if __name__ == "__main__":
-    main()
