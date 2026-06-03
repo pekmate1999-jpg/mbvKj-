@@ -28,15 +28,12 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 Licitnapló Diagnosztikus Monitor elindult...")
+    print("🚀 Licitnapló Mélygörgető és Direkt Link Monitor elindult...")
     old_records = load_database()
     
-    # A pontos, készre szűrt Licitnapló URL
     target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2000000&status=aktiv"
-    
     html_content = ""
     
-    # Virtuális böngésző indítása, hogy a Licitnapló ne tudja blokkolni a kérést
     with sync_playwright() as p:
         try:
             print("--> Virtuális Chrome indítása...")
@@ -46,77 +43,104 @@ def main():
             )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 1600}
+                viewport={"width": 1280, "height": 3000}
             )
             page = context.new_page()
             print(f"--> URL megnyitása: {target_url}")
             
             page.goto(target_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(3000)
             
+            # --- LAZY LOADING JÁTSZMA: Dinamikus görgetés az összes tételért ---
+            print("--> Szakaszos mélygörgetés indítása a teljes lista betöltéséhez...")
+            previous_height = page.evaluate("document.body.scrollHeight")
+            
+            for scroll_step in range(15):  # Akár 15-ször is legördül, hogy biztosan elérje az alját
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+                page.wait_for_timeout(1500)  # Vár egy kicsit, amíg a szerver beadja az új kártyákat
+                
+                new_height = page.evaluate("document.body.scrollHeight")
+                if new_height == previous_height:
+                    # Ha a magasság nem változott, elértük az abszolút alját az 50 hirdetésnek
+                    break
+                previous_height = new_height
+            
+            print("--> Minden tétel sikeresen lerenderelve a virtuális képernyőn.")
             html_content = page.content()
             browser.close()
         except Exception as e:
             print(f"❌ Playwright hiba: {e}")
-            send_telegram_message(f"⚠️ *Licitnapló Monitor Hiba:* Nem sikerült megnyitni az oldalt a böngészővel.\nHiba: {e}")
             return
 
     if not html_content or len(html_content) < 1000:
-        print("📭 Az oldal forrása üres vagy túl rövid.")
-        send_telegram_message("❌ *Licitnapló Monitor:* A szerver üres oldalt küldött vissza (Blokkolás gyanú).")
         return
 
     soup = BeautifulSoup(html_content, "html.parser")
     
-    # Szelektorfüggetlen szöveges blokkkeresés a kártyák mintájára (Település + Ft összeg)
-    # A Licitnapló kártyáit a bennük lévő irányítószámok és 'Ft' feliratok alapján fogjuk meg
-    blocks = re.findall(r'([^<>]+?\d{4}\s+[^<>]+?\d+[\d\s]*Ft)', html_content)
-    
-    # Ha a regex nem talált semmit, megpróbáljuk a nyers text-alapú kártyakeresést
-    if not blocks:
-        text_elements = soup.find_all(text=re.compile(r'\d+[\d\s]*Ft'))
-        blocks = [el.parent.parent.get_text() for el in text_elements if el.parent and el.parent.parent]
-
-    print(f"📋 Talált nyers hirdetési blokkok száma: {len(blocks)}")
+    # A Licitnapló hirdetései a Bootstrap struktúra szerint div-ekben laknak, amik tartalmaznak árat.
+    # Megkeressük az összes div-et, ami a 'card' osztályt viseli.
+    cards = soup.find_all("div", class_=lambda x: x and 'card' in x.lower())
+    print(f"📋 Összesen beolvasott hirdetési kártyák száma: {len(cards)}")
     
     arveresek = []
     feldolgozott_idk = set()
 
-    for block in blocks:
+    for card in cards:
         try:
-            # Megkeressük az árat a blokkban
-            price_match = re.search(r'(\d+[\d\s]*)\s*Ft', block)
-            if not price_match:
+            # Megpróbáljuk kinyerni a kártya belső linkjét vagy azonosítóját
+            # A Licitnapló gombjai vagy képei gyakran hordozzák az egyedi azonosítót a linkben
+            link_el = card.find("a")
+            href = link_el.get("href") if link_el else ""
+            
+            card_text = card.get_text(separator="\n").strip()
+            lines = [l.strip() for l in card_text.split("\n") if l.strip()]
+            if not lines or "000 Ft" not in card_text:
                 continue
-            price = int(price_match.group(1).replace(" ", "").replace("\xa0", "").strip())
+
+            # 1. Település és Cím bányászat
+            telepules = lines[0]
+            cim = lines[1] if len(lines) > 1 and not any(x in lines[1] for x in ["Ft", "nap", "MBVK"]) else telepules
             
-            # Szigorú árszűrés (2 000 000 Ft alatt)
-            if not (50000 <= price <= 2000000):
+            # 2. Ár kinyerése
+            kikialtasi_ar = 0
+            for line in lines:
+                if "ft" in line.lower():
+                    digits = "".join(filter(str.isdigit, line))
+                    if digits and 50000 <= int(digits) <= 2000000:
+                        kikialtasi_ar = int(digits)
+                        break
+            
+            if kikialtasi_ar == 0:
                 continue
-                
-            # Megtisztítjuk a szöveget a felesleges szóközöktől és törésektől
-            clean_text = re.sub(r'\s+', ' ', block).strip()
-            
-            # Generálunk egy egyedi ID-t a szöveg elejéből és az árból
-            auction_id = "ln_" + "".join(filter(str.isalnum, clean_text[:20])) + f"_{price}"
-            
+
+            # 3. DIREKT ADATLAP LINK GENERÁLÁSA
+            # Ha van belső relatív link az a-tagben (pl. /adatlap-valami-12345), azt használjuk
+            if href and len(href) > 2 and not href.startswith("#"):
+                full_link = href if href.startswith("http") else f"https://licitnaplo.hu{href}"
+                # Kinyerjük a link végén lévő egyedi számot azonosítónak
+                id_match = re.search(r'(\d+)(?:[^\d]*)$', href)
+                auction_id = f"ln_{id_match.group(1)}" if id_match else f"ln_{hash(clean_text[:15])}"
+            else:
+                # B-terv: ha nem talált közvetlen linket, magából a címből gyártunk ID-t, a link pedig a főoldal marad
+                slug = "".join(filter(str.isalnum, cim))[:20]
+                auction_id = f"ln_{slug}_{kikialtasi_ar}"
+                full_link = target_url
+
             if auction_id in feldolgozott_idk:
                 continue
             feldolgozott_idk.add(auction_id)
 
-            # Megpróbáljuk szépen szétszedni a települést és a címet
-            parts = [p.strip() for p in clean_text.split(",") if p.strip()]
-            telepules = parts[0] if parts else "Licitnapló Ingatlan"
-            
             arveresek.append({
                 "id": auction_id,
                 "telepules": telepules,
-                "cim": clean_text[:100] + "...",
-                "ar": price
+                "cim": cim,
+                "ar": kikialtasi_ar,
+                "link": full_link
             })
         except:
             continue
 
+    print(f"📊 Megrostált, egyedi ingatlanok száma: {len(arveresek)}")
     new_found_count = 0
 
     for prop in arveresek:
@@ -130,19 +154,18 @@ def main():
             ar_kiiras = f"{kikialtasi_ar:,} HUF"
             üzenet = (
                 f"🚨 *ÚJ OLCSÓ INGATLAN TALÁLAT!* (Licitnapló)\n\n"
-                f"📍 *Helyszín:* {prop['telepules']}\n"
-                f"🏠 *Leírás:* {prop['cim']}\n"
+                f"📍 *Település:* {prop['telepules']}\n"
+                f"🏠 *Pontos cím:* {prop['cim']}\n"
                 f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
                 f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
-                f"🔗 [Megnyitás a Licitnapló Keresőben]({target_url})"
+                f"🔗 [Ugrás a konkrét hirdetmény adatlapjára]({prop['link']})"
             )
             send_telegram_message(üzenet)
 
     if new_found_count > 0:
         save_database(old_records)
-        print(f"💾 {new_found_count} új ingatlan elmentve.")
+        print(f"💾 {new_found_count} új tétel elmentve.")
     else:
-        # A kért egyedi státuszüzenet, ha lefutott a kód, de nincs új tétel a limit alatt
         print("😴 Nincs új találat.")
         send_telegram_message("✅Sikeres Futtatás.❌ Nincs új tárgy.❌")
 
