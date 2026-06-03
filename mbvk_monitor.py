@@ -27,10 +27,10 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 Licitnapló Univerzális Kártya Monitor elindult...")
+    print("🚀 Licitnapló Blokkelemző Monitor elindult...")
     old_records = load_database()
     
-    # Készre szűrt Licitnapló URL (0 - 2 000 000 Ft, 1/1, beköltözhető, tehermentes, aktív)
+    # A képeden látható pontos, készre szűrt URL
     target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2000000&status=aktiv"
     
     headers = {
@@ -48,92 +48,86 @@ def main():
 
     soup = BeautifulSoup(response.text, "html.parser")
     
-    # Megkeressük az összes olyan div-et, ami hirdetési kártyaként funkcionál az oldalon
-    cards = soup.find_all("div", class_=lambda x: x and 'card' in x.lower())
-    print(f"📋 Talált nyers kártyák száma a HTML-ben: {len(cards)}")
+    # A Licitnapló kártyái egyszerű szöveges blokkként is tökéletesen elkülöníthetők a bennük lévő ' Ft' jelölés miatt.
+    # Megkeressük az összes olyan div elemet, aminek a szövegében szerepel az ár és a cím.
+    # A Bootstrap alapú elrendezés miatt a 'col-' osztályú konténereket fogjuk meg, amik a kártyákat tartják.
+    containers = soup.find_all("div", class_=lambda x: x and ('col-' in x or 'card' in x))
     
-    new_found_count = 0
-    feldolgozott_idk = set()
+    arveresek = []
+    feldolgozott_szovegek = set()
 
-    for card in cards:
+    for container in containers:
+        # Csak azokat a blokkokat nézzük, amikben van konkrét ár (Ft) és nem a lábléc vagy fejléc részei
+        text = container.get_text(separator="\n").strip()
+        if "000 Ft" not in text or "Keresel" in text or "Kapcsolat" in text:
+            continue
+            
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if len(lines) < 2:
+            continue
+            
+        # Egyedi szűrés, hogy egy hirdetést ne olvassunk be többször a DOM egymásba ágyazottsága miatt
+        tiszta_blokk = " | ".join(lines[:4])
+        if tiszta_blokk in feldolgozott_szovegek:
+            continue
+        feldolgozott_szovegek.add(tiszta_blokk)
+
         try:
-            # Megkeressük a kártyához tartozó linket
-            link_element = card.find("a")
-            if not link_element:
-                continue
-                
-            href = link_element.get("href")
-            if not href or href == "#" or "javascript" in href:
-                continue
-
-            # Generálunk egy egyedi azonosítót a linkből a duplikációk ellen
-            clean_id = "".join(filter(str.isalnum, href))
-            if not clean_id or clean_id in feldolgozott_idk:
-                continue
-            feldolgozott_idk.add(clean_id)
-
-            card_text = card.get_text(separator="\n")
-            lines = [l.strip() for l in card_text.split("\n") if l.strip()]
-            
-            if not lines:
-                continue
-
-            # 1. Helyszín meghatározása: a kártya legelső értelmes sorát vesszük alapul
+            # --- ADATBÁNYÁSZAT A KÁRTYÁBÓL ---
             telepules = lines[0]
+            cim = lines[1] if len(lines) > 1 else telepules
             
-            # 2. Ár kinyerése a kártya szövegéből
+            # Összegyűjtjük az árat
             kikialtasi_ar = 0
             for line in lines:
                 if "ft" in line.lower():
                     digits = "".join(filter(str.isdigit, line))
-                    if digits and 50000 <= int(digits) <= 2500000:
+                    if digits and 50000 <= int(digits) <= 2000000:
                         kikialtasi_ar = int(digits)
                         break
-
-            # Ha a kártyán belül nem találtunk árat, vagy az kiesett a tartományból, biztonsági okokból átugorjuk
+            
             if kikialtasi_ar == 0:
                 continue
 
-            # 3. Ügyszám keresése
-            ugyszam = "Lásd az adatlapon"
-            for line in lines:
-                ugyszam_match = re.search(r'\d+\.V\.\d+(?:/\d+)?', line)
-                if ugyszam_match:
-                    ugyszam = ugyszam_match.group(0)
-                    break
+            # Mivel nincs fix azonosító a HTML-ben, a címből és az árból képzünk egyedi ID-t az adatbázisnak
+            auction_id = "ln_" + "".join(filter(str.isalnum, cim)) + f"_{kikialtasi_ar}"
 
-            # Teljes elérés létrehozása
-            full_link = href if href.startswith("http") else f"https://licitnaplo.hu{href}"
-            auction_id = f"ln_{clean_id}"
-
-            # --- SZŰRÉS ÉS TELEGRAM ÉRTESÍTÉS ---
-            if auction_id not in old_records:
-                new_found_count += 1
-                old_records.append(auction_id)
-
-                ar_kiiras = f"{kikialtasi_ar:,} HUF"
-                
-                üzenet = (
-                    f"🚨 *ÚJ OLCSÓ INGATLAN TALÁLAT!* (Licitnapló)\n\n"
-                    f"📍 *Helyszín:* {telepules}\n"
-                    f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
-                    f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n"
-                    f"🔹 *Ügyszám:* `{ugyszam}`\n\n"
-                    f"🔗 [Ugrás a konkrét hirdetmény adatlapjára]({full_link})"
-                )
-                
-                send_telegram_message(üzenet)
-                
-        except Exception as e:
+            arveresek.append({
+                "id": auction_id,
+                "telepules": telepules,
+                "cim": cim,
+                "ar": kikialtasi_ar
+            })
+        except:
             continue
+
+    print(f"📊 Megtalált és tisztított ingatlanok száma: {len(arveresek)}")
+    new_found_count = 0
+
+    for prop in arveresek:
+        auction_id = prop["id"]
+        kikialtasi_ar = prop["ar"]
+
+        if auction_id not in old_records:
+            new_found_count += 1
+            old_records.append(auction_id)
+
+            ar_kiiras = f"{kikialtasi_ar:,} HUF"
+            üzenet = (
+                f"🚨 *ÚJ OLCSÓ INGATLAN TALÁLAT!* (Licitnapló)\n\n"
+                f"📍 *Település:* {prop['telepules']}\n"
+                f"🏠 *Pontos cím:* {prop['cim']}\n"
+                f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
+                f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
+                f"🔗 [Megnyitás a Licitnapló Keresőben]({target_url})"
+            )
+            send_telegram_message(üzenet)
 
     if new_found_count > 0:
         save_database(old_records)
         print(f"💾 {new_found_count} új ingatlan elmentve.")
     else:
         print("😴 Nincs új találat.")
-        # Ezt a sort tesztelés után ki lehet venni, de most bent hagyjuk, hogy lásd: lefutott a kód!
-        send_telegram_message("✅ *Licitnapló Monitor:* A keresés sikeresen lefutott, de jelenleg nincs a feltételeknek megfelelő új ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
     main()
