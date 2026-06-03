@@ -1,8 +1,6 @@
 import os
 import json
 import requests
-from bs4 import BeautifulSoup
-import re
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -27,107 +25,148 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 Licitnapló Blokkelemző Monitor elindult...")
+    print("🚀 Licitnapló API Monitor elindult...")
     old_records = load_database()
     
-    # A képeden látható pontos, készre szűrt URL
-    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2000000&status=aktiv"
+    # A Licitnapló belső adatlekérdező végpontja a te pontos szűrési paramétereiddel
+    api_url = "https://licitnaplo.hu/api/auctions?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2000000&status=aktiv"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://licitnaplo.hu/"
     }
     
     try:
-        response = requests.get(target_url, headers=headers, timeout=30)
+        response = requests.get(api_url, headers=headers, timeout=30)
         if response.status_code != 200:
-            print(f"❌ Licitnapló hiba: {response.status_code}")
+            print(f"❌ API hiba: {response.status_code}")
+            # Ha az API közvetlenül nem elérhető, megpróbáljuk a sima főoldalt hátha beágyazott JSON van benne
+            parse_from_html_backup(old_records)
             return
+        
+        data = response.json()
     except Exception as e:
-        print(f"❌ Hálózati hiba: {e}")
+        print(f"❌ Kivétel az API hívás során: {e}")
+        parse_from_html_backup(old_records)
         return
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    
-    # A Licitnapló kártyái egyszerű szöveges blokkként is tökéletesen elkülöníthetők a bennük lévő ' Ft' jelölés miatt.
-    # Megkeressük az összes olyan div elemet, aminek a szövegében szerepel az ár és a cím.
-    # A Bootstrap alapú elrendezés miatt a 'col-' osztályú konténereket fogjuk meg, amik a kártyákat tartják.
-    containers = soup.find_all("div", class_=lambda x: x and ('col-' in x or 'card' in x))
-    
-    arveresek = []
-    feldolgozott_szovegek = set()
+    # Az API válaszból kiszedjük az aukciók listáját (általában 'items', 'data' vagy maga a lista)
+    auctions = []
+    if isinstance(data, list):
+        auctions = data
+    elif isinstance(data, dict):
+        auctions = data.get("items", data.get("data", data.get("auctions", [])))
 
-    for container in containers:
-        # Csak azokat a blokkokat nézzük, amikben van konkrét ár (Ft) és nem a lábléc vagy fejléc részei
-        text = container.get_text(separator="\n").strip()
-        if "000 Ft" not in text or "Keresel" in text or "Kapcsolat" in text:
-            continue
-            
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        if len(lines) < 2:
-            continue
-            
-        # Egyedi szűrés, hogy egy hirdetést ne olvassunk be többször a DOM egymásba ágyazottsága miatt
-        tiszta_blokk = " | ".join(lines[:4])
-        if tiszta_blokk in feldolgozott_szovegek:
-            continue
-        feldolgozott_szovegek.add(tiszta_blokk)
+    print(f"📋 API által visszaadott nyers hirdetések száma: {len(auctions)}")
+    process_auctions(auctions, old_records)
 
+
+def parse_from_html_backup(old_records):
+    """B-terv: Ha az API végpont zárt lenne, a főoldal tiszta text-elemzésével szedjük ki a kártyákat"""
+    print("🔄 B-terv: Szelektorfélreértés-mentes szöveges elemzés indítása...")
+    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2000000&status=aktiv"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    try:
+        res = requests.get(target_url, headers=headers, timeout=20)
+        html_content = res.text
+    except:
+        return
+
+    # Regexszel kivágjuk az összes olyan szövegrészt, ami településnévvel kezdődik és 'Ft'-ra végződik
+    # A Licitnapló forrásában a kártyák jól látható mintát követnek
+    blocks = re.findall(r'([^<>]+?\d{4}\s+[^<>]+?\d+[\d\s]*Ft)', html_content)
+    auctions = []
+    
+    for block in blocks:
         try:
-            # --- ADATBÁNYÁSZAT A KÁRTYÁBÓL ---
-            telepules = lines[0]
-            cim = lines[1] if len(lines) > 1 else telepules
-            
-            # Összegyűjtjük az árat
-            kikialtasi_ar = 0
-            for line in lines:
-                if "ft" in line.lower():
-                    digits = "".join(filter(str.isdigit, line))
-                    if digits and 50000 <= int(digits) <= 2000000:
-                        kikialtasi_ar = int(digits)
-                        break
-            
-            if kikialtasi_ar == 0:
+            # Megkeressük benne az árat
+            price_match = re.search(r'(\d+[\d\s]*)\s*Ft', block)
+            if not price_match:
                 continue
-
-            # Mivel nincs fix azonosító a HTML-ben, a címből és az árból képzünk egyedi ID-t az adatbázisnak
-            auction_id = "ln_" + "".join(filter(str.isalnum, cim)) + f"_{kikialtasi_ar}"
-
-            arveresek.append({
+            price = int(price_match.group(1).replace(" ", "").strip())
+            
+            if not (50000 <= price <= 2000000):
+                continue
+                
+            # Kiszedjük a települést és a címet a megtalált szövegtömbből
+            clean_block = re.sub(r'\s+', ' ', block).strip()
+            
+            # Generálunk egy egyedi ID-t a szövegből
+            auction_id = "ln_b_" + "".join(filter(str.isalnum, clean_block[:30])) + f"_{price}"
+            
+            auctions.append({
                 "id": auction_id,
-                "telepules": telepules,
-                "cim": cim,
-                "ar": kikialtasi_ar
+                "title": "Licitnapló Ingatlan",
+                "address": clean_block,
+                "price": price,
+                "url": "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2000000&status=aktiv"
             })
         except:
             continue
+            
+    process_auctions(auctions, old_records)
 
-    print(f"📊 Megtalált és tisztított ingatlanok száma: {len(arveresek)}")
+
+def process_auctions(auctions, old_records):
+    if not auctions:
+        print("😴 Nincs feldolgozható hirdetés.")
+        return
+
     new_found_count = 0
 
-    for prop in arveresek:
-        auction_id = prop["id"]
-        kikialtasi_ar = prop["ar"]
+    for item in auctions:
+        try:
+            # Rugalmas mezőkezelés attól függően, hogy az API hogyan nevezi a kulcsokat
+            auction_id = str(item.get("id", item.get("_id", item.get("auctionId", ""))))
+            if not auction_id:
+                continue
+                
+            db_id = f"ln_{auction_id}"
+            
+            telepules = item.get("city", item.get("telepules", item.get("title", "Licitnapló Ingatlan")))
+            cim = item.get("address", item.get("cim", item.get("location", telepules)))
+            kikialtasi_ar = int(item.get("price", item.get("ar", item.get("currentPrice", 0))))
+            ugyszam = item.get("caseNumber", item.get("ugyszam", "Lásd az adatlapon"))
+            
+            # Ha az ár valamiért 0 vagy nem jött át, megpróbáljuk kiszedni a nyers adatokból
+            if kikialtasi_ar == 0:
+                continue
 
-        if auction_id not in old_records:
-            new_found_count += 1
-            old_records.append(auction_id)
+            slug = item.get("slug", "")
+            if slug:
+                full_link = f"https://licitnaplo.hu/arveres/{slug}"
+            else:
+                full_link = f"https://licitnaplo.hu/arveres/{auction_id}"
 
-            ar_kiiras = f"{kikialtasi_ar:,} HUF"
-            üzenet = (
-                f"🚨 *ÚJ OLCSÓ INGATLAN TALÁLAT!* (Licitnapló)\n\n"
-                f"📍 *Település:* {prop['telepules']}\n"
-                f"🏠 *Pontos cím:* {prop['cim']}\n"
-                f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
-                f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
-                f"🔗 [Megnyitás a Licitnapló Keresőben]({target_url})"
-            )
-            send_telegram_message(üzenet)
+            # --- SZŰRÉS ÉS TELEGRAM KÜLDÉS ---
+            if db_id not in old_records:
+                new_found_count += 1
+                old_records.append(db_id)
+
+                ar_kiiras = f"{kikialtasi_ar:,} HUF"
+                üzenet = (
+                    f"🚨 *ÚJ OLCSÓ INGATLAN TALÁLAT!* (Licitnapló API)\n\n"
+                    f"📍 *Település:* {telepules}\n"
+                    f"🏠 *Pontos cím:* {cim}\n"
+                    f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
+                    f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n"
+                    f"🔹 *Ügyszám:* `{ugyszam}`\n\n"
+                    f"🔗 [Ugrás a konkrét hirdetmény adatlapjára]({full_link})"
+                )
+                send_telegram_message(üzenet)
+                
+        except Exception as e:
+            print(f"⚠️ Hiba egy tétel feldolgozásakor: {e}")
+            continue
 
     if new_found_count > 0:
         save_database(old_records)
         print(f"💾 {new_found_count} új ingatlan elmentve.")
     else:
         print("😴 Nincs új találat.")
+
 
 if __name__ == "__main__":
     main()
