@@ -12,8 +12,10 @@ CONFIG_FILE = "monitor_config.json"
 def load_database():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
-            try: return json.load(f)
-            except: return []
+            try:
+                return json.load(f)
+            except:
+                return []
     return []
 
 def save_database(data):
@@ -24,8 +26,10 @@ def load_and_update_config():
     config = {"keyword": "mind", "max_ar": 2000000}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            try: config = json.load(f)
-            except: pass
+            try:
+                config = json.load(f)
+            except:
+                pass
 
     # Lekérjük az utolsó frissítést és nyugtázzuk
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -33,10 +37,13 @@ def load_and_update_config():
         res = requests.get(url, timeout=10).json()
         if res.get("ok"):
             updates = res.get("result", [])
+            highest_update_id = None
+            
             for update in updates:
                 message = update.get("message", {})
                 text = message.get("text", "").strip()
                 update_id = update.get("update_id")
+                highest_update_id = update_id
                 
                 if text.startswith("/szures"):
                     parts = text.split()
@@ -48,42 +55,16 @@ def load_and_update_config():
                             config["max_ar"] = int(parts[1])
                         else:
                             config["keyword"] = parts[1]
-                
-                # Nyugtázzuk az üzenetet, hogy ne olvassa újra
-                requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={update_id + 1}")
+            
+            # Nyugtázzuk az üzeneteket egyszerre a legmagasabb ID alapján, hogy ne olvassa újra őket
+            if highest_update_id is not None:
+                requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={highest_update_id + 1}", timeout=10)
                 
     except Exception as e:
         print(f"⚠️ Telegram konfigurációs hiba: {e}")
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
-    return config
-
-    # Telegram üzenetek ellenőrzése parancsok után
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    try:
-        res = requests.get(url, timeout=10).json()
-        if res.get("ok"):
-            for update in res.get("result", []):
-                message = update.get("message", {})
-                text = message.get("text", "").strip()
-                
-                if text.startswith("/szures"):
-                    parts = text.split()
-                    if len(parts) >= 3:
-                        config["keyword"] = parts[1]
-                        config["max_ar"] = int(parts[2])
-                    elif len(parts) == 2:
-                        if parts[1].isdigit():
-                            config["max_ar"] = int(parts[1])
-                        else:
-                            config["keyword"] = parts[1]
-    except Exception as e:
-        print(f"⚠️ Nem sikerült frissíteni a konfigurációt: {e}")
-
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
-        
     return config
 
 def send_telegram_message(text):
@@ -96,21 +77,22 @@ def send_telegram_message(text):
 def main():
     print("🚀 Licitnapló Távirányítós Szövegbányász Monitor elindult...")
     old_records = load_database()
-# A GitHubon a 'print' logok segítenek látni, mi történik
-print(f"DEBUG: Jelenlegi adatbázis mérete: {len(old_records)} tétel.")
+    
+    # A GitHubon a 'print' logok segítenek látni, mi történik
+    print(f"DEBUG: Jelenlegi adatbázis mérete: {len(old_records)} tétel.")
 
     # Konfiguráció betöltése (Telegram vezérlés) 
-config = load_and_update_config()
-print(f"🔍 Aktív szűrés -> Kulcsszó: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
+    config = load_and_update_config()
+    print(f"🔍 Aktív szűrés -> Kulcsszó: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
     
-    # A tágabb listát kérjük le, hogy a Python szűrhessen
-target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2500000&status=aktiv"
+    # A tágabb listát kérjük le (kiterjesztve 5 000 000 Ft-ig), hogy a Python szűrhessen
+    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-5000000&status=aktiv"
     
-links_data = []
-body_text = ""
+    links_data = []
+    body_text = ""
     
-with sync_playwright() as p:
-    try:
+    with sync_playwright() as p:
+        try:
             print("--> Virtuális Chrome indítása...")
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
             context = browser.new_context(
@@ -161,7 +143,7 @@ with sync_playwright() as p:
                 for line in lines:
                     if "ft" in line.lower():
                         digits = "".join(filter(str.isdigit, line))
-                        if digits and 50000 <= int(digits) <= 3000000:
+                        if digits and 50000 <= int(digits) <= 5000000:
                             kikialtasi_ar = int(digits)
                             break
                 
