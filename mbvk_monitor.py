@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import re
+from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -223,12 +224,17 @@ def main():
             new_found_count += 1
             old_records.append(auction_id)
 
+            # Google Maps kereső link összeállítása (ékezet- és szóközbiztosan)
+            keresendo_cim = f"{prop['telepules']} {prop['cim']}".replace("...", "").strip()
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(keresendo_cim)}"
+
             üzenet = (
                 f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* 🎯\n\n"
                 f"📍 *Település:* {prop['telepules']}\n"
                 f"🏠 *Cím / Infó:* {prop['cim']}\n"
                 f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
                 f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
+                f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
                 f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
             )
             send_telegram_message(üzenet)
