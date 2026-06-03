@@ -110,7 +110,7 @@ links_data = []
 body_text = ""
     
 with sync_playwright() as p:
-try:
+    try:
             print("--> Virtuális Chrome indítása...")
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
             context = browser.new_context(
