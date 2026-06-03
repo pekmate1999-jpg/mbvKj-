@@ -21,13 +21,43 @@ def save_database(data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 def load_and_update_config():
-    """Beolvassa a mentett szűrési feltételeket, majd frissíti, ha írtál újat Telegramon"""
     config = {"keyword": "mind", "max_ar": 2000000}
-    
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             try: config = json.load(f)
             except: pass
+
+    # Lekérjük az utolsó frissítést és nyugtázzuk
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        res = requests.get(url, timeout=10).json()
+        if res.get("ok"):
+            updates = res.get("result", [])
+            for update in updates:
+                message = update.get("message", {})
+                text = message.get("text", "").strip()
+                update_id = update.get("update_id")
+                
+                if text.startswith("/szures"):
+                    parts = text.split()
+                    if len(parts) >= 3:
+                        config["keyword"] = parts[1]
+                        config["max_ar"] = int(parts[2])
+                    elif len(parts) == 2:
+                        if parts[1].isdigit():
+                            config["max_ar"] = int(parts[1])
+                        else:
+                            config["keyword"] = parts[1]
+                
+                # Nyugtázzuk az üzenetet, hogy ne olvassa újra
+                requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={update_id + 1}")
+                
+    except Exception as e:
+        print(f"⚠️ Telegram konfigurációs hiba: {e}")
+
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=4)
+    return config
 
     # Telegram üzenetek ellenőrzése parancsok után
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
