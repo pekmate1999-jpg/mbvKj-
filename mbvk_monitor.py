@@ -3,247 +3,124 @@ import json
 import requests
 import re
 from urllib.parse import quote_plus
+import html
 from playwright.sync_api import sync_playwright
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DB_FILE = "mbvk_adatbazis.json"
-CONFIG_FILE = "monitor_config.json"
 
 def load_database():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except:
-                return []
-    return []
+            try: 
+                # Halmazként (set) térünk vissza a gyorsabb keresésért
+                return set(json.load(f))
+            except Exception as e:
+                print(f"⚠️ Hiba az adatbázis betöltésekor: {e}")
+                return set()
+    return set()
 
-def save_database(data):
+def save_database(data_set):
     with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-def load_and_update_config():
-    config = {"keyword": "mind", "max_ar": 2000000}
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            try:
-                config = json.load(f)
-            except:
-                pass
-
-    # Lekérjük az utolsó frissítést és nyugtázzuk
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    try:
-        res = requests.get(url, timeout=10).json()
-        if res.get("ok"):
-            updates = res.get("result", [])
-            highest_update_id = None
-            
-            for update in updates:
-                message = update.get("message", {})
-                text = message.get("text", "").strip()
-                update_id = update.get("update_id")
-                highest_update_id = update_id
-                
-                if text.startswith("/szures"):
-                    parts = text.split()
-                    if len(parts) >= 3:
-                        config["keyword"] = parts[1]
-                        config["max_ar"] = int(parts[2])
-                    elif len(parts) == 2:
-                        if parts[1].isdigit():
-                            config["max_ar"] = int(parts[1])
-                        else:
-                            config["keyword"] = parts[1]
-            
-            # Nyugtázzuk az üzeneteket egyszerre a legmagasabb ID alapján, hogy ne olvassa újra őket
-            if highest_update_id is not None:
-                requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={highest_update_id + 1}", timeout=10)
-                
-    except Exception as e:
-        print(f"⚠️ Telegram konfigurációs hiba: {e}")
-
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
-    return config
+        # A JSON mentéshez vissza kell alakítani listává
+        json.dump(list(data_set), f, ensure_ascii=False, indent=4)
 
 def send_telegram_message(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Hiányzó Telegram hitelesítő adatok!")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        # HTML formátum használata a biztonságosabb formázásért
+        response = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID, 
+            "text": text, 
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True # Ne generáljon hatalmas előnézeteket
+        }, timeout=10)
+        response.raise_for_status()
     except Exception as e:
         print(f"❌ Telegram küldési hiba: {e}")
 
-def main():
-    print("🚀 Licitnapló Távirányítós Szövegbányász Monitor elindult...")
-    old_records = load_database()
-    
-    # A GitHubon a 'print' logok segítenek látni, mi történik
-    print(f"DEBUG: Jelenlegi adatbázis mérete: {len(old_records)} tétel.")
+def get_property_details(page, url):
+    """Bejárja az adatlapot és kinyeri a kért adatokat."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        
+        # PRO TIPP: Cseréld le a 'body'-t arra a specifikus div-re, amiben az adatok vannak!
+        # page.wait_for_selector(".listing-details-container", timeout=5000)
+        content = page.inner_text("body")
+        
+        telekm_match = re.search(r"(?:Telekméret|Telek területe|Teleknagyság)[:\s]+([\d\s]+)\s*(?:nm|m2|négyzetméter)", content, re.IGNORECASE)
+        leiras_match = re.search(r"(?:Leírás|Megjegyzés)[:\s]+(.+?)(?:\n|$)", content, re.IGNORECASE)
+        nm_ar_match = re.search(r"(?:Négyzetméterár|Ft/m2)[:\s]+([\d\s]+)\s*Ft", content, re.IGNORECASE)
+        
+        return {
+            "telekméret": telekm_match.group(1).strip() if telekm_match else "Nincs megadva",
+            "leiras": (leiras_match.group(1).strip()[:150] + "...") if leiras_match else "Nincs leírás.",
+            "nm_ar": nm_ar_match.group(1).strip() if nm_ar_match else "N/A"
+        }
+    except Exception as e:
+        print(f"⚠️ Hiba az adatlap olvasásakor ({url}): {e}")
+        return {"telekméret": "Hiba", "leiras": "Nem olvasható", "nm_ar": "N/A"}
 
-    # Konfiguráció betöltése (Telegram vezérlés) 
-    config = load_and_update_config()
-    print(f"🔍 Aktív szűrés -> Kulcsszó: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
-    
-    # A tágabb listát kérjük le (kiterjesztve 5 000 000 Ft-ig), hogy a Python szűrhessen
-    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-5000000&status=aktiv"
-    
-    links_data = []
-    body_text = ""
+def main():
+    old_records = load_database()
+    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&ar=0-1000000&epuletTipus=&besorolas=&forras=&status="
     
     with sync_playwright() as p:
-        try:
-            print("--> Virtuális Chrome indítása...")
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 3000}
-            )
-            page = context.new_page()
-            page.goto(target_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(4000)
-            
-            # Dinamikus görgetés (A 35+ tétel kényszerítése)
-            print("--> Szakaszos mélygörgetés...")
-            for i in range(15):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-                page.wait_for_timeout(1500)
-            
-            # A MŰKÖDŐ EXTRAKCIÓ: Közvetlenül a DOM-ból bányásszuk ki a linkeket
-            links_data = page.evaluate("""() => {
-                const links = Array.from(document.querySelectorAll('a'));
-                return links.map(a => ({
-                    href: a.href,
-                    text: a.innerText || ""
-                }));
-            }""")
-            
-            body_text = page.locator("body").inner_text()
-            browser.close()
-        except Exception as e:
-            print(f"❌ Playwright hiba: {e}")
-            return
-
-    arveresek = []
-    feldolgozott_idk = set()
-
-    # Feldolgozás a működő logikával
-    for item in links_data:
-        href = item.get("href", "")
-        text = item.get("text", "").strip()
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = context.new_page()
         
-        if "000 Ft" in text and "licitnaplo.hu/" in href and not any(x in href for x in ["status=", "ar=", "bekoltozheto="]):
-            try:
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
-                if not lines:
-                    continue
-                
-                # Ár kinyerése
-                kikialtasi_ar = 0
-                for line in lines:
-                    if "ft" in line.lower():
-                        digits = "".join(filter(str.isdigit, line))
-                        if digits and 50000 <= int(digits) <= 5000000:
-                            kikialtasi_ar = int(digits)
-                            break
-                
-                if kikialtasi_ar == 0:
-                    continue
-                
-                # --- DINAMIKUS SZŰRÉSEK ---
-                if kikialtasi_ar > config["max_ar"]:
-                    continue
-                    
-                if config["keyword"].lower() != "mind":
-                    if config["keyword"].lower() not in text.lower():
-                        continue
+        try:
+            page.goto(target_url, wait_until="networkidle", timeout=60000)
+            
+            # Csak azokat a linkeket gyűjtjük be, amik tényleg adatlapra mutatnak
+            # Ezt a CSS szelektort ('a') érdemes pontosítani, pl. '.card-title a'
+            links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
+            unique_links = list(set([l for l in links if "licitnaplo.hu/" in l and not any(x in l for x in ["status=", "ar="])]))
 
-                telepules = lines[0]
-                cim = lines[1] if len(lines) > 1 and "Ft" not in lines[1] else telepules
+            for link in unique_links:
+                clean_id = "".join(filter(str.isalnum, link.split("/")[-1]))
                 
-                clean_id = "".join(filter(str.isalnum, href.split("/")[-1]))
-                if not clean_id:
-                    clean_id = "".join(filter(str.isalnum, cim))[:20] + f"_{kikialtasi_ar}"
-                    
-                auction_id = f"ln_{clean_id}"
-                
-                if auction_id in feldolgozott_idk:
+                # Gyors (O(1)) keresés a Set-ben
+                if clean_id in old_records: 
                     continue
-                feldolgozott_idk.add(auction_id)
                 
-                arveresek.append({
-                    "id": auction_id,
-                    "telepules": telepules,
-                    "cim": cim,
-                    "ar": kikialtasi_ar,
-                    "link": href
-                })
-            except:
-                continue
-
-    # B-TERV (Szöveges törzs alapján, ha a link üres lenne)
-    if not arveresek:
-        blocks = re.findall(r'([^<> \n]+?\d{4}\s+[^<> \n]+?[\s\S]*?\d+[\d\s]*Ft)', body_text)
-        for block in blocks:
-            try:
-                if config["keyword"].lower() != "mind" and config["keyword"].lower() not in block.lower():
-                    continue
-                    
-                price_match = re.search(r'(\d+[\d\s]*)\s*Ft', block)
-                if not price_match:
-                    continue
-                price = int(price_match.group(1).replace(" ", "").replace("\xa0", "").strip())
+                print(f"🔍 Új találat feldolgozása: {link}")
+                details = get_property_details(page, link)
                 
-                if price > config["max_ar"]:
-                    continue
-                    
-                clean_text = re.sub(r'\s+', ' ', block).strip()
-                auction_id = "ln_txt_" + "".join(filter(str.isalnum, clean_text[:15])) + f"_{price}"
+                # Cím kinyerése és escape-elése a HTML formátumhoz
+                raw_title = link.split('/')[-1].replace('-', ' ').title()
+                safe_title = html.escape(raw_title)
+                safe_leiras = html.escape(details['leiras'])
                 
-                if auction_id in feldolgozott_idk:
-                    continue
-                feldolgozott_idk.add(auction_id)
+                # Valódi Google Maps kereső link
+                maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(raw_title)}"
                 
-                arveresek.append({
-                    "id": auction_id,
-                    "telepules": clean_text[:30],
-                    "cim": clean_text[:60] + "...",
-                    "ar": price,
-                    "link": target_url
-                })
-            except:
-                continue
-
-    print(f"📊 Megmaradt szűrt ingatlanok száma: {len(arveresek)}")
-    new_found_count = 0
-
-    for prop in arveresek:
-        auction_id = prop["id"]
-        if auction_id not in old_records:
-            new_found_count += 1
-            old_records.append(auction_id)
-
-            # Google Maps kereső link összeállítása (ékezet- és szóközbiztosan)
-            keresendo_cim = f"{prop['telepules']} {prop['cim']}".replace("...", "").strip()
-            maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(keresendo_cim)}"
-
-            üzenet = (
-                f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* 🎯\n\n"
-                f"📍 *Település:* {prop['telepules']}\n"
-                f"🏠 *Cím / Infó:* {prop['cim']}\n"
-                f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
-                f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
-                f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
-            )
-            send_telegram_message(üzenet)
-
-    if new_found_count > 0:
-        save_database(old_records)
-        print(f"💾 {new_found_count} új tétel elmentve.")
-    else:
-        print("😴 Nincs új találat.")
-        send_telegram_message(f"✅ *Futtatás sikeres.*\n🔍 *Aktív szűrő:* `{config['keyword']}` | `{config['max_ar']:,} Ft` alatt.\n❌ Új tárgy nem érkezett.")
+                # HTML formázott üzenet
+                üzenet = (
+                    f"🏠 <b>Cím:</b> {safe_title}\n"
+                    f"💰 <b>Kikiáltási ár:</b> Új találat\n"
+                    f"📏 <b>Telekméret:</b> {details['telekméret']} nm\n"
+                    f"💵 <b>Négyzetméterár:</b> {details['nm_ar']} Ft/nm\n"
+                    f"📝 <b>Leírás:</b> {safe_leiras}\n\n"
+                    f"🗺️ <a href='{maps_url}'>Megtekintés Google Maps-en</a>\n"
+                    f"🔗 <a href='{link}'>Ugrás az ingatlan adatlapjára</a>"
+                )
+                
+                send_telegram_message(üzenet)
+                old_records.add(clean_id) # Set-hez adjuk hozzá
+                
+        except Exception as e:
+            print(f"❌ Végzetes hiba futás közben: {e}")
+        finally:
+            browser.close()
+    
+    save_database(old_records)
 
 if __name__ == "__main__":
     main()
