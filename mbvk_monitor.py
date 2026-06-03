@@ -35,7 +35,7 @@ def kinyer_extra_infok(szoveg, kikialtasi_ar):
     szoveg_clean = re.sub(r'\s+', ' ', szoveg.replace('\xa0', ' ')).strip()
     szoveg_low = szoveg_clean.lower()
     
-    # 1. Alapterület / Telekméret keresése (ha esetleg mégis szerepelne a főoldalon)
+    # 1. Alapterület / Telekméret keresése
     meret_match = re.search(r'(\d+[\d\s]*)\s*(m²|m2|nm|négyzetméter|negyzetmeter)', szoveg_low)
     size_num = None
     telekmeret = None
@@ -89,11 +89,13 @@ def ellenoriz_kulcsszo(beallitott_kulcsszo, vizsgalt_szoveg):
     return kw in txt
 
 def load_and_update_config():
-    config = {"keyword": "mind", "max_ar": 2000000}
+    # MODOSÍTVA: Az alapértelmezett maximum ár átállítva 1 000 000 Ft-ra
+    config = {"keyword": "mind", "max_ar": 1000000}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             try:
                 config = json.load(f)
+                config["max_ar"] = 1000000  # Kényszerített frissítés a fájlban is
             except Exception:
                 pass
 
@@ -146,7 +148,8 @@ def main():
     config = load_and_update_config()
     print(f"🔍 Aktív szűrés -> Csoport: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
     
-    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-5000000&status=aktiv"
+    # MODOSÍTVA: Dinamikus URL-kezelés – így a weboldal eleve csak az 1 millió alattiakat küldi el!
+    target_url = f"https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-{config['max_ar']}&status=aktiv"
     
     links_data = []
     body_text = ""
@@ -160,13 +163,16 @@ def main():
                 viewport={"width": 1280, "height": 3000}
             )
             page = context.new_page()
-            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            
+            # FONTOS JAVÍTÁS: "networkidle"-re állítva, hogy megvárja az aszinkron Javascript kártyák betöltődését!
+            print(f"--> Oldal betöltése: {target_url}")
+            page.goto(target_url, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(4000)
             
             print("--> Szakaszos mélygörgetés...")
-            for i in range(15):
+            for i in range(20):  # Megemelve 20-ra a 160 találat biztonságos legörgetéséhez
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(1200)
             
             links_data = page.evaluate("""() => {
                 const links = Array.from(document.querySelectorAll('a'));
@@ -200,7 +206,8 @@ def main():
                 for line in lines:
                     if "ft" in line.lower():
                         digits = "".join(filter(str.isdigit, line))
-                        if digits and 50000 <= int(digits) <= 5000000:
+                        # Megemelt belső plafon a feldolgozáshoz, hogy semmilyen formátum ne akadjon el
+                        if digits and 10000 <= int(digits) <= 50000000:
                             kikialtasi_ar = int(digits)
                             break
                 
@@ -290,7 +297,6 @@ def main():
             keresendo_cim = f"{prop['telepules']} {prop['cim']}".replace("...", "").strip()
             maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(keresendo_cim)}"
 
-            # Dinamikus üzenetépítés a kért, egyszerűsített új fejléccel
             msg_lines = [
                 f"🚨 *ÚJ TALÁLAT*\n",
                 f"📍 *Település:* {prop['telepules']}",
@@ -322,3 +328,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
