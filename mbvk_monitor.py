@@ -8,8 +8,9 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DB_FILE = "mbvk_adatbazis.json"
 
-# === TESZT MÓD ===
-# Most True-ra van állítva, hogy BÁRMILYEN hirdetést elkapjon (autót, gépet is), így ellenőrizni tudjuk a formázást!
+# === TESZT ÜZEMMÓD ===
+# True: Kiküld 3 mintát az adatok és linkek ellenőrzéséhez. 
+# Ha a kapott üzenet tökéletes, állítsd át False-ra az éles működéshez!
 TESZT_MOD = True 
 
 def load_database():
@@ -31,11 +32,9 @@ def send_telegram_message(text):
         print(f"❌ Telegram küldési hiba: {e}")
 
 def main():
-    print("🚀 MBVK Kikényszerített Teszt Monitor elindult...")
+    print("🚀 MBVK Vizuális Precíziós Monitor elindult...")
     old_records = load_database()
-    
-    captured_data = {"items": []}
-    backup_auctions = []
+    arveresek = []
 
     with sync_playwright() as p:
         print("--> Virtuális Chrome indítása...")
@@ -49,122 +48,134 @@ def main():
         )
         page = context.new_page()
 
-        # A-TERV: Háttér API elcsípése (bármilyen listát elfogadunk a teszthez)
-        def on_response(response):
-            if "publicapi/auction/list" in response.url:
-                try:
-                    json_res = response.json()
-                    if "items" in json_res and len(json_res["items"]) > 0:
-                        captured_data["items"] = json_res["items"]
-                        print(f"🎯 SIKER! Elcsípve {len(json_res['items'])} db nyers hirdetés az API-ból!")
-                except:
-                    pass
-
-        page.on("response", on_response)
-
-        # SZŰRETLEN FŐOLDAL megnyitása a teszthez, hogy biztosan legyen találat a képernyőn
-        target_url = "https://arveres.mbvk.hu/"
-        print(f"--> Teszt URL megnyitása: {target_url}")
+        # Közvetlen, előre szűrt ingatlanos URL
+        target_url = "https://arveres.mbvk.hu/#/kereses?kategoria=INGATLAN&allapot=AKTIV&tulajdon=1%2F1&tehermentes=true&bekoltozheto=true"
+        print(f"--> URL megnyitása: {target_url}")
         
-        page.goto(target_url, wait_until="load", timeout=60000)
+        page.goto(target_url, wait_until="networkidle", timeout=60000)
         
-        print("--> Keresés gomb megnyomása a felületen...")
+        print("--> Várakozás a hirdetési kártyák beágyazódására...")
         try:
-            # Megnyomjuk a főoldali kereső gombot, hogy az összes aktív hirdetést betöltse a felületre
-            page.locator("button:has-text('Keresés'), .search-button, btn-primary").first.click()
-            page.wait_for_timeout(5000)
-            page.evaluate("window.scrollBy(0, 500);")
+            # Megvárjuk, amíg a modern Angular kártyaelemek fizikailag kirajzolódnak
+            page.wait_for_selector("mat-card, .mat-row, tr, .card", timeout=20000)
+            page.evaluate("window.scrollBy(0, 400);")
             page.wait_for_timeout(3000)
         except Exception as e:
-            print(f"⚠️ Nem sikerült a gombra kattintani, de görgetünk: {e}")
-            page.evaluate("window.scrollBy(0, 500);")
-            page.wait_for_timeout(5000)
+            print(f"⚠️ Nem jelentek meg a kártyák időben: {e}")
 
-        # B-TERV: Ha az API elcsípés elcsúszott, közvetlenül a felületi kártyákból szedjük ki a nyers adatokat
-        if len(captured_data["items"]) == 0:
-            print("🔄 B-TERV: Felületi elemek közvetlen feldolgozása...")
-            # Minden létező kártyaszerű elemet megnézünk
-            cards = page.locator("mat-card, .card, [role='row'], .mat-row, .auction-item").all()
-            print(f"📋 Talált kártya elemek száma a képernyőn: {len(cards)}")
-            
-            for card in cards:
-                try:
-                    text_content = card.inner_text()
-                    if not text_content or len(text_content.strip()) < 20:
-                        continue
-                    
-                    # Ügyszám keresése
-                    ugyszam_match = re.search(r'(\d+\.V\.\d+/\d+)|(\d+\.V\.\d+)', text_content)
-                    ugyszam = ugyszam_match.group(0) if ugyszam_match else "Ismeretlen"
-                    
-                    # Egyedi belső ID generálása a szövegből a teszthez
-                    digits = "".join(filter(str.isdigit, text_content))
-                    auction_id = digits[:10] if len(digits) > 4 else "12345"
+        # Kiválasztjuk az összes hirdetési blokkot
+        cards = page.locator("mat-card, .mat-row, tr, .card").all()
+        print(f"📋 Képernyőn talált nyers blokkok száma: {len(cards)}")
 
-                    # Ár kiszedése
-                    kikialtasi_ar = 0
-                    for word in text_content.replace(".", "").replace(",", "").split():
-                        if word.isdigit() and 4 <= len(word) <= 9:
-                            kikialtasi_ar = int(word)
-                            break
-
-                    # Település / Megnevezés kiszedése (Az első értelmes sor)
-                    lines = [l.strip() for l in text_content.split("\n") if l.strip()]
-                    telepules = lines[0][:40] if lines else "MBVK Tétel"
-
-                    backup_auctions.append({
-                        "id": auction_id,
-                        "caseNumber": ugyszam,
-                        "city": telepules,
-                        "minBid": kikialtasi_ar
-                    })
-                except:
+        for card in cards:
+            try:
+                text_content = card.inner_text()
+                if not text_content or "ft" not in text_content.lower():
                     continue
+
+                # Kiszűrjük az ingóságokat a biztonság kedvéért
+                text_lower = text_content.lower()
+                if any(bad in text_lower for bad in ["személygépkocsi", "tehergépkocsi", "üzletrész", "ingóság"]):
+                    continue
+
+                # --- 1. ÜGYSZÁM ÉS ID BÁNYÁSZAT ---
+                # Megkeressük a végrehajtói ügyszámot (pl. 123.V.456/2026)
+                ugyszam_match = re.search(r'(\d+\.V\.\d+/\d+)|(\d+\.V\.\d+)', text_content)
+                if ugyszam_match:
+                    ugyszam = ugyszam_match.group(0)
+                    # Az ID-t az ügyszámból képezzük, így tiszta és stabil marad
+                    auction_id = ugyszam.replace(".", "_").replace("/", "_")
+                else:
+                    continue
+
+                # --- 2. ÁR MEGHATÁROZÁSA ---
+                kikialtasi_ar = 0
+                # Megkeressük a kikiáltási ár után álló számot
+                ar_match = re.findall(r'(?:kikiáltási\s+ár|minimálár|ár):\s*([\d\s\.]+)\s*Ft', text_lower)
+                if ar_match:
+                    kikialtasi_ar = int("".join(filter(str.isdigit, ar_match[0])))
+                else:
+                    # B-terv árkeresésre: a legnagyobb szám a blokkban
+                    digits_list = [int("".join(filter(str.isdigit, w))) for w in text_content.replace(".", " ").split() if "".join(filter(str.isdigit, w)).isdigit()]
+                    prices = [d for d in digits_list if 100000 <= d <= 500000000]
+                    if prices:
+                        kikialtasi_ar = max(prices)
+
+                # --- 3. HELYSZÍN PONTOS MEGHATÁROZÁSA ---
+                telepules = "MBVK Ingatlan"
+                lines = [l.strip() for l in text_content.split("\n") if l.strip()]
+                for line in lines:
+                    # A helyszín az a sor, ami nem tartalmaz dátumot, nem ügyszám, nem tartalmaz árat és elég hosszú
+                    if (len(line) > 4 and 
+                        not re.search(r'\d{4}\.\d{2}\.\d{2}', line) and 
+                        not re.search(r'\d+\.V\.\d+', line) and 
+                        "ft" not in line.lower() and 
+                        "kikiáltási" not in line.lower() and
+                        "minimál" not in line.lower() and
+                        "licit" not in line.lower()):
+                        telepules = line
+                        break
+
+                # --- 4. GYÁRI KÖZVETLEN LINK ---
+                # Mivel az ügyszám megvan, az MBVK gyári keresője az ügyszám paraméterrel közvetlenül az adatlapra ugrik!
+                full_link = f"https://arveres.mbvk.hu/#/reszletek?ugyszam={ugyszam}"
+
+                if not any(x["id"] == auction_id for x in arveresek):
+                    arveresek.append({
+                        "id": auction_id,
+                        "ugyszam": ugyszam,
+                        "telepules": telepules,
+                        "ar": kikialtasi_ar,
+                        "link": full_link
+                    })
+            except:
+                continue
 
         browser.close()
 
-    # Összefésülés
-    auctions = captured_data["items"] if len(captured_data["items"]) > 0 else backup_auctions
-    print(f"📊 Összesen feldolgozható nyers teszt hirdetés száma: {len(auctions)}")
-
-    if not auctions:
-        send_telegram_message("🤖 *MBVK Monitor:* A teszt lefutott, de a szűretlen oldalon sem találtam elemet. Kérlek indítsd újra!")
-        return
-
+    print(f"📊 Feldolgozott ingatlanok száma: {len(arveresek)}")
     new_found_count = 0
 
-    for item in auctions:
-        try:
-            auction_id = str(item.get("id", "0"))
-            ugyszam = item.get("caseNumber", "Nincs megadva")
-            telepules = item.get("city", "Ismeretlen")
-            kikialtasi_ar = int(item.get("minBid", 0))
+    for prop in arveresek:
+        auction_id = prop["id"]
+        kikialtasi_ar = prop["ar"]
 
-            # Teszt link generálás (ha van rendes ID, akkor az adatlapra, ha nincs, a főoldalra)
-            full_link = f"https://arveres.mbvk.hu/#/reszletek?id={auction_id}" if auction_id != "12345" else "https://arveres.mbvk.hu/"
+        # Élesben 2M HUF limit, teszt módban mindent átengedünk
+        if kikialtasi_ar <= 2000000 or TESZT_MOD:
+            if auction_id not in old_records or TESZT_MOD:
+                new_found_count += 1
+                
+                if not TESZT_MOD:
+                    old_records.append(auction_id)
 
-            new_found_count += 1
-            ar_kiiras = f"{kikialtasi_ar:,} HUF" if kikialtasi_ar > 0 else "Lásd az adatlapon"
+                ar_kiiras = f"{kikialtasi_ar:,} HUF" if kikialtasi_ar > 0 else "Lásd az adatlapon"
+                teszt_prefix = "⚠️ *TESZT ÜZEMMÓD TALÁLAT*\n" if TESZT_MOD else ""
 
-            üzenet = (
-                f"⚠️ *TESZT ÜZEMMÓD (BÁRMILYEN KATEGÓRIA)*\n\n"
-                f"🚨 *ÚJ TALÁLAT!*\n\n"
-                f"📍 *Megnevezés/Helyszín:* {telepules}\n"
-                f"🔹 *Ügyszám:* {ugyszam}\n"
-                f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
-                f"📋 *Feltételek:* Tesztelés alatt\n\n"
-                f"🔗 [Ugrás a hirdetményre]({full_link})"
-            )
-            
-            send_telegram_message(üzenet)
-            
-            # Csak 2 darabot küldünk ki, hogy lásd a formázást
-            if new_found_count >= 2:
-                break
-        except:
-            continue
+                üzenet = (
+                    f"{teszt_prefix}"
+                    f"🚨 *ÚJ MBVK INGATLAN TALÁLAT!*\n\n"
+                    f"📍 *Helyszín:* {prop['telepules']}\n"
+                    f"🔹 *Ügyszám:* {prop['ugyszam']}\n"
+                    f"💰 *Kikiáltási ár:* {ar_kiiras}\n"
+                    f"📋 *Feltételek:* 1/1, Tehermentes, Beköltözhető\n\n"
+                    f"🔗 [Ugrás a konkrét hirdetményre]({prop['link']})"
+                )
+                
+                send_telegram_message(üzenet)
+                
+                if TESZT_MOD and new_found_count >= 3:
+                    break
 
-    send_telegram_message("✅ *MBVK Monitor:* A szűretlen teszt futás lezárult. Ha megérkezett a 2 minta üzenet, jelezd vissza!")
+    if TESZT_MOD:
+        if len(arveresek) > 0:
+            send_telegram_message("✅ *MBVK Monitor Teszt:* Sikeres vizuális beolvasás! Ha a fenti 3 üzenet adatai és linkjei tökéletesek, állítsd át a kódban: `TESZT_MOD = False`!")
+        else:
+            send_telegram_message("⚠️ *MBVK Monitor Teszt:* A kód lefutott, de az MBVK oldala jelenleg teljesen üres erre a szűrésre. Próbáld meg kicsit később!")
+    else:
+        if new_found_count > 0:
+            save_database(old_records)
+        else:
+            send_telegram_message("✅ *MBVK Monitor:* A keresés sikeresen lefutott. Jelenleg nincs új tiszta ingatlan 2 000 000 Ft alatt.")
 
 if __name__ == "__main__":
     main()
