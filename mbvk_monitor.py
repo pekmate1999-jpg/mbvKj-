@@ -104,10 +104,10 @@ config = load_and_update_config()
 print(f"🔍 Aktív szűrés -> Kulcsszó: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
     
     # A tágabb listát kérjük le, hogy a Python szűrhessen
-    target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2500000&status=aktiv"
+target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-2500000&status=aktiv"
     
-    links_data = []
-    body_text = ""
+links_data = []
+body_text = ""
     
     with sync_playwright() as p:
     try:
