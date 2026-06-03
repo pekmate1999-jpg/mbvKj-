@@ -1,61 +1,53 @@
 import os
-import csv
+import re
 import html
 import sqlite3
-import logging
 import requests
 from datetime import datetime
 from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
-DB = "mbvk.db"
-LOG = "mbvk.log"
-CSV_EXPORT = "ingatlanok.csv"
+MAX_PRICE = 1_000_000
+
+TARGET_URL = (
+    "https://licitnaplo.hu/"
+    "?bekoltozheto=true"
+    "&tulajdoniHanyad=true"
+    "&ar=0-1000000"
+)
+
+COUNTIES = [
+    "veszprém", "zala", "somogy", "pest",
+    "komárom", "fejér", "nógrád",
+    "bács-kiskun", "jász-nagykun"
+]
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TARGET_URL = "https://licitnaplo.hu/"
 
-logging.basicConfig(
-    filename=LOG,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
-
-class Storage:
-
+class DB:
     def __init__(self):
-        self.conn = sqlite3.connect(DB)
+        self.conn = sqlite3.connect("mbvk_v5.db")
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS properties(
-            id TEXT PRIMARY KEY,
-            url TEXT,
-            title TEXT,
-            price TEXT,
-            first_seen TEXT,
-            last_seen TEXT
+            url TEXT PRIMARY KEY,
+            created TEXT
         )
         """)
         self.conn.commit()
 
-    def exists(self, pid):
+    def exists(self, url):
         cur = self.conn.execute(
-            "SELECT 1 FROM properties WHERE id=?",
-            (pid,)
+            "SELECT 1 FROM properties WHERE url=?",
+            (url,)
         )
         return cur.fetchone() is not None
 
-    def add(self, pid, url, title, price):
-        now = datetime.now().isoformat()
-
+    def add(self, url):
         self.conn.execute(
-            """
-            INSERT OR REPLACE INTO properties
-            VALUES(?,?,?,?,?,?)
-            """,
-            (pid, url, title, price, now, now)
+            "INSERT OR REPLACE INTO properties VALUES(?,?)",
+            (url, datetime.now().isoformat())
         )
         self.conn.commit()
 
@@ -64,86 +56,71 @@ class Storage:
 
 
 def telegram(msg):
-
     if not TOKEN or not CHAT_ID:
-        return False
+        return
 
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": msg,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            },
-            timeout=30
-        )
-
-        return r.status_code == 200
-
-    except Exception as e:
-        logging.exception(e)
-        return False
+    requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        },
+        timeout=30
+    )
 
 
-def export_csv(rows):
-
-    with open(CSV_EXPORT, "w", newline="", encoding="utf-8") as f:
-
-        writer = csv.writer(f)
-
-        writer.writerow([
-            "title",
-            "price",
-            "url"
-        ])
-
-        writer.writerows(rows)
-
-
-def scrape_property(page, url):
-
-    data = {
-        "title": "Ismeretlen",
-        "price": "N/A"
-    }
-
-    try:
-
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=30000
-        )
-
+def extract_price(text):
+    matches = re.findall(r'([\d\s\xa0]+)\s*Ft', text)
+    for m in matches:
         try:
-            data["title"] = page.locator("h1").first.inner_text()
+            return int(m.replace(" ", "").replace("\xa0", ""))
         except:
             pass
+    return None
 
-        body = page.inner_text("body")
 
-        for line in body.splitlines():
-            if "Ft" in line:
-                data["price"] = line.strip()
-                break
+def extract_land_size(text):
 
-    except Exception as e:
-        logging.exception(e)
+    patterns = [
+        r'([\d\s]+)\s*m²',
+        r'([\d\s]+)\s*m2',
+        r'([\d\s]+)\s*nm',
+        r'Telekméret[:\s]+([\d\s]+)',
+        r'Telek területe[:\s]+([\d\s]+)'
+    ]
 
-    return data
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            try:
+                return int(
+                    m.group(1)
+                    .replace(" ", "")
+                    .replace("\xa0", "")
+                )
+            except:
+                pass
+
+    return None
+
+
+def allowed_county(text):
+    text = text.lower()
+    return any(c in text for c in COUNTIES)
 
 
 def collect_links(page):
 
     page.goto(
         TARGET_URL,
-        wait_until="domcontentloaded"
+        wait_until="domcontentloaded",
+        timeout=60000
     )
 
-    previous = 0
-    retries = 0
+    prev = 0
+    same = 0
 
     while True:
 
@@ -164,31 +141,47 @@ def collect_links(page):
 
         current = len(set(links))
 
-        if current == previous:
-            retries += 1
-
-            if retries >= 3:
+        if current == prev:
+            same += 1
+            if same >= 3:
                 break
         else:
-            retries = 0
-            previous = current
+            same = 0
+            prev = current
 
     return sorted(list(set(links)))
 
 
+def scrape(page, url):
+
+    page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=30000
+    )
+
+    try:
+        title = page.locator("h1").first.inner_text()
+    except:
+        title = url
+
+    body = page.inner_text("body")
+
+    return {
+        "title": title,
+        "body": body,
+        "price": extract_price(body),
+        "land_size": extract_land_size(body)
+    }
+
+
 def main():
 
-    telegram("🚀 MBVK PRO V3 indult")
+    db = DB()
 
-    db = Storage()
+    stats_new = 0
 
-    exported = []
-
-    stats = {
-        "new": 0,
-        "checked": 0,
-        "errors": 0
-    }
+    telegram("🚀 MBVK V5 futás indult")
 
     with sync_playwright() as p:
 
@@ -199,83 +192,64 @@ def main():
 
         ctx = browser.new_context()
 
-        try:
+        page = ctx.new_page()
 
-            page = ctx.new_page()
+        links = collect_links(page)
 
-            links = collect_links(page)
+        for url in links:
 
-            for url in links:
+            if db.exists(url):
+                continue
 
-                stats["checked"] += 1
+            detail = ctx.new_page()
 
-                pid = url
+            try:
 
-                if db.exists(pid):
+                data = scrape(detail, url)
+
+                if not data["price"]:
                     continue
 
-                detail_page = ctx.new_page()
+                if data["price"] > MAX_PRICE:
+                    continue
 
-                data = scrape_property(
-                    detail_page,
-                    url
-                )
+                if not allowed_county(data["body"]):
+                    continue
 
-                detail_page.close()
+                sqm_price = "N/A"
 
-                db.add(
-                    pid,
-                    url,
-                    data["title"],
-                    data["price"]
-                )
+                if data["land_size"] and data["land_size"] > 0:
+                    sqm = round(
+                        data["price"] / data["land_size"]
+                    )
+                    sqm_price = f"{sqm:,} Ft/m²"
 
-                exported.append([
-                    data["title"],
-                    data["price"],
-                    url
-                ])
-
-                maps = (
+                maps_url = (
                     "https://www.google.com/maps/search/?api=1&query="
                     + quote_plus(data["title"])
                 )
 
                 telegram(
                     f"🏠 <b>{html.escape(data['title'])}</b>\n\n"
-                    f"💰 {html.escape(data['price'])}\n\n"
-                    f"🗺️ <a href='{maps}'>Térkép</a>\n"
+                    f"💰 Ár: {data['price']:,} Ft\n"
+                    f"📏 Telekméret: {data['land_size'] or 'N/A'} m²\n"
+                    f"📐 Négyzetméterár: {sqm_price}\n\n"
+                    f"🗺️ <a href='{maps_url}'>Google Maps</a>\n"
                     f"🔗 <a href='{url}'>Adatlap</a>"
                 )
 
-                stats["new"] += 1
+                db.add(url)
+                stats_new += 1
 
-            export_csv(exported)
+            finally:
+                detail.close()
 
-        except Exception as e:
+        browser.close()
 
-            stats["errors"] += 1
+    if stats_new == 0:
+        telegram("✅ Nem találtam új, feltételeknek megfelelő ingatlant.")
 
-            telegram(
-                f"❌ Hiba:\n{html.escape(str(e))}"
-            )
-
-            logging.exception(e)
-
-        finally:
-
-            browser.close()
-            db.close()
-
-    telegram(
-        f"📊 Összesítő\n\n"
-        f"Ellenőrzött: {stats['checked']}\n"
-        f"Új: {stats['new']}\n"
-        f"Hibák: {stats['errors']}"
-    )
-
-    if stats["new"] == 0:
-        telegram("✅ Nem találtam új ingatlant.")
+    telegram(f"📊 Futás vége. Új találatok: {stats_new}")
 
 
 if __name__ == "__main__":
