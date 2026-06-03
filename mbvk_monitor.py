@@ -5,10 +5,21 @@ import re
 from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright
 
+# Környezeti változók és fájlok
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DB_FILE = "mbvk_adatbazis.json"
 CONFIG_FILE = "monitor_config.json"
+
+# Perzisztens (folyamatosan látható) gombok konfigurációja
+FILTER_KEYBOARD = {
+    "keyboard": [
+        [{"text": "/szures pest 1000000"}, {"text": "/szures pest 2000000"}],
+        [{"text": "/szures balaton 2000000"}, {"text": "/szures videk 2000000"}]
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": False  # False = Mindig ott marad a képernyő alján!
+}
 
 def load_database():
     if os.path.exists(DB_FILE):
@@ -23,37 +34,64 @@ def save_database(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+def kinyer_extra_infok(szoveg, kikialtasi_ar):
+    """
+    Kibányássza a szövegből a méretet, minimálárat és aktuális licitet,
+    valamint kiszámolja a négyzetméterárat.
+    """
+    szoveg_low = szoveg.lower()
+    
+    # 1. Alapterület / Telekméret keresése (pl. 54 m², 120 m2, 450 nm)
+    meret_match = re.search(r'(\d+[\d\s]*)\s*(m²|m2|nm)', szoveg_low)
+    size_num = None
+    telekmeret = "Nincs információ"
+    if meret_match:
+        try:
+            clean_size = "".join(filter(str.isdigit, meret_match.group(1)))
+            if clean_size:
+                size_num = int(clean_size)
+                telekmeret = f"{size_num:,} m²"
+        except:
+            pass
+        
+    minimal_ar = "Nincs megadva"
+    aktualis_licit = "Nincs aktív licit"
+    
+    # 2. Soronkénti elemzés a kulcsszavakhoz
+    for line in szoveg.split("\n"):
+        l_low = line.lower().strip()
+        if any(x in l_low for x in ["minimál", "minimal", "min.ár", "minimum"]):
+            digits = "".join(filter(str.isdigit, l_low))
+            if digits:
+                minimal_ar = f"{int(digits):,} HUF"
+        if any(x in l_low for x in ["aktuális", "aktualis", "jelenlegi", "licit", "itt tart"]):
+            if not any(x in l_low for x in ["kikiáltási", "kikialtasi", "minimál", "minimal"]):
+                digits = "".join(filter(str.isdigit, l_low))
+                if digits:
+                    aktualis_licit = f"{int(digits):,} HUF"
+                    
+    # 3. Négyzetméterár kiszámítása
+    nm_ar = "Nem számítható"
+    if size_num and size_num > 0 and kikialtasi_ar > 0:
+        nm_ar = f"{round(kikialtasi_ar / size_num):,} HUF/m²"
+        
+    return aktualis_licit, minimal_ar, telekmeret, nm_ar
+
 def ellenoriz_kulcsszo(beallitott_kulcsszo, vizsgalt_szoveg):
-    """
-    Intelligens szűrő, ami kezeli a sima szavakat és a komplex megyecsoportokat is.
-    """
     kw = beallitott_kulcsszo.lower().strip()
     txt = vizsgalt_szoveg.lower()
     
     if kw == "mind":
         return True
-        
     if kw == "pest":
         return "pest" in txt
-        
     if kw == "balaton":
-        # Felhasználó által kért megyék a Balatonhoz
         balaton_megyek = ["zala", "somogy", "veszprém", "veszprem"]
         return any(megye in txt for megye in balaton_megyek)
-        
     if kw in ["videk", "vidék"]:
-        # Felhasználó által kért vidéki megyék
-        videk_megyek = [
-            "nógrád", "nograd", 
-            "komárom", "komarom", 
-            "tolna", 
-            "fejér", "fejer", 
-            "jász", "jasz", 
-            "bács", "bacs"
-        ]
+        videk_megyek = ["nógrád", "nograd", "komárom", "komarom", "tolna", "fejér", "fejer", "jász", "jasz", "bács", "bacs"]
         return any(megye in txt for megye in videk_megyek)
         
-    # Bármilyen egyéb egyedi kulcsszó esetén (pl. ha kézzel beírod, hogy 'győr')
     return kw in txt
 
 def load_and_update_config():
@@ -65,7 +103,6 @@ def load_and_update_config():
             except:
                 pass
 
-    # Lekérjük az utolsó frissítést a Telegramról
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     try:
         res = requests.get(url, timeout=10).json()
@@ -79,19 +116,11 @@ def load_and_update_config():
                 update_id = update.get("update_id")
                 highest_update_id = update_id
                 
-                # Ha a kopasz /szures parancs érkezik, felajánljuk a pontos gombokat
-                if text == "/szures":
-                    keyboard = {
-                        "keyboard": [
-                            [{"text": "/szures pest 1000000"}, {"text": "/szures pest 2000000"}],
-                            [{"text": "/szures balaton 2000000"}, {"text": "/szures videk 2000000"}]
-                        ],
-                        "resize_keyboard": True,
-                        "one_time_keyboard": True
-                    }
-                    send_telegram_message("💡 *Válassz egy szűrést az alábbi gombok közül:*", reply_markup=keyboard)
+                clean_cmd = text.split("@")[0].strip()
                 
-                # Ha a parancs paraméterekkel jön (gombnyomásra vagy kézi beírásra)
+                if clean_cmd == "/szures":
+                    send_telegram_message("💡 *Válassz egy szűrést az alábbi gombok közül:*")
+                
                 elif text.startswith("/szures"):
                     parts = text.split()
                     if len(parts) >= 3:
@@ -103,7 +132,6 @@ def load_and_update_config():
                         else:
                             config["keyword"] = parts[1]
             
-            # Nyugtázzuk az üzeneteket, hogy ne olvassa be őket újra
             if highest_update_id is not None:
                 requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={highest_update_id + 1}", timeout=10)
                 
@@ -115,10 +143,18 @@ def load_and_update_config():
     return config
 
 def send_telegram_message(text, reply_markup=None):
+    """
+    Üzenetet küld. Ha nincs egyedi gomb megadva, automatikusan rákényszeríti 
+    a perzisztens billentyűzetet, hogy az mindig ott maradjon a chaten.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+    
+    if reply_markup is None:
+        payload["reply_markup"] = json.dumps(FILTER_KEYBOARD)
+    else:
+        payload["reply_markup"] = json.dumps(reply_markup)
+        
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
@@ -129,12 +165,11 @@ def main():
     old_records = load_database()
     
     print(f"DEBUG: Jelenlegi adatbázis mérete: {len(old_records)} tétel.")
-
-    # Konfiguráció frissítése a Telegram gombok alapján
-    config = load_and_update_config()
-    print(f"🔍 Aktív szűrés -> Kulcsszó csoport: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
     
-    # Kiterjesztett alap lekérés 5M Ft-ig, a szűrést a Python végzi el
+    config = load_and_update_config()
+    print(f"🔍 Aktív szűrés -> Csoport: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
+    
+    # 5M-ig kérjük le az alaplistát, a szűrést a Python végzi a config alapján
     target_url = "https://licitnaplo.hu/?bekoltozheto=true&tulajdoniHanyad=true&tehermentes=true&ar=0-5000000&status=aktiv"
     
     links_data = []
@@ -193,14 +228,9 @@ def main():
                             kikialtasi_ar = int(digits)
                             break
                 
-                if kikialtasi_ar == 0:
-                    continue
-                
-                # --- ÁRSZŰRÉS ---
-                if kikialtasi_ar > config["max_ar"]:
+                if kikialtasi_ar == 0 or kikialtasi_ar > config["max_ar"]:
                     continue
                     
-                # --- MEGYECSOPORT / KULCSSZÓ SZŰRÉS ---
                 if not ellenoriz_kulcsszo(config["keyword"], text):
                     continue
 
@@ -217,22 +247,27 @@ def main():
                     continue
                 feldolgozott_idk.add(auction_id)
                 
+                akt_licit, min_ar, t_meret, nm_ar = kinyer_extra_infok(text, kikialtasi_ar)
+                
                 arveresek.append({
                     "id": auction_id,
                     "telepules": telepules,
                     "cim": cim,
                     "ar": kikialtasi_ar,
-                    "link": href
+                    "link": href,
+                    "aktualis_licit": akt_licit,
+                    "minimal_ar": min_ar,
+                    "telekmeret": t_meret,
+                    "nm_ar": nm_ar
                 })
             except:
                 continue
 
-    # B-TERV (Törzsszöveg alapján, ha a DOM linkek üresek lennének)
+    # B-TERV (Szöveges törzs alapján, ha a DOM üres lenne)
     if not arveresek:
         blocks = re.findall(r'([^<> \n]+?\d{4}\s+[^<> \n]+?[\s\S]*?\d+[\d\s]*Ft)', body_text)
         for block in blocks:
             try:
-                # --- MEGYECSOPORT / KULCSSZÓ SZŰRÉS ---
                 if not ellenoriz_kulcsszo(config["keyword"], block):
                     continue
                     
@@ -241,7 +276,6 @@ def main():
                     continue
                 price = int(price_match.group(1).replace(" ", "").replace("\xa0", "").strip())
                 
-                # --- ÁRSZŰRÉS ---
                 if price > config["max_ar"]:
                     continue
                     
@@ -252,12 +286,18 @@ def main():
                     continue
                 feldolgozott_idk.add(auction_id)
                 
+                akt_licit, min_ar, t_meret, nm_ar = kinyer_extra_infok(block, price)
+                
                 arveresek.append({
                     "id": auction_id,
                     "telepules": clean_text[:30],
                     "cim": clean_text[:60] + "...",
                     "ar": price,
-                    "link": target_url
+                    "link": target_url,
+                    "aktualis_licit": akt_licit,
+                    "minimal_ar": min_ar,
+                    "telekmeret": t_meret,
+                    "nm_ar": nm_ar
                 })
             except:
                 continue
@@ -271,15 +311,18 @@ def main():
             new_found_count += 1
             old_records.append(auction_id)
 
-            # Google Maps hivatkozás generálása
             keresendo_cim = f"{prop['telepules']} {prop['cim']}".replace("...", "").strip()
             maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(keresendo_cim)}"
 
             üzenet = (
                 f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!*\n\n"
                 f"📍 *Település / Régió:* {prop['telepules']}\n"
-                f"🏠 *Cím / Infó:* {prop['cim']}\n"
+                f"🏠 *Cím:* {prop['cim']}\n"
                 f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
+                f"📈 *Aktuális licit:* {prop['aktualis_licit']}\n"
+                f"📉 *Minimum ár:* {prop['minimal_ar']}\n"
+                f"📐 *Telekméret / Alapterület:* {prop['telekmeret']}\n"
+                f"🧮 *Négyzetméterár:* {prop['nm_ar']}\n\n"
                 f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
                 f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
             )
