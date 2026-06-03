@@ -294,14 +294,10 @@ def main():
             max_ar_formazott = f"{config['max_ar']:,} Ft"
 
             üzenet = (
-                f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* (`{kategoria_nev}` | `{max_ar_formazott}` alatt)\n\n"
-                f"📍 *Település / Régió:* {prop['telepules']}\n"
+                f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* \n\n"
+                f"📍 *Település:* {prop['telepules']}\n"
                 f"🏠 *Cím:* {prop['cim']}\n"
                 f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
-                f"📈 *Aktuális licit:* {prop['aktualis_licit']}\n"
-                f"📉 *Minimum ár:* {prop['minimal_ar']}\n"
-                f"📐 *Telekméret / Alapterület:* {prop['telekmeret']}\n"
-                f"🧮 *Négyzetméterár:* {prop['nm_ar']}\n\n"
                 f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
                 f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
             )
