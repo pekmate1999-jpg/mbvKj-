@@ -16,11 +16,11 @@ def load_database():
         with open(DB_FILE, "r", encoding="utf-8") as f:
             try:
                 data = json.load(f)
-                # HA VÉLETLENÜL SZÓTÁR (DICT) LENNE, ÁTALAKÍTJUK LISTÁVÁ
+                # Ha véletlenül szótár (dict) mentődött el, a kulcsok a mentett ID-k
                 if isinstance(data, dict):
                     return list(data.keys())
                 return data if isinstance(data, list) else []
-            except:
+            except Exception:
                 return []
     return []
 
@@ -35,7 +35,7 @@ def kinyer_extra_infok(szoveg, kikialtasi_ar):
     """
     szoveg_low = szoveg.lower()
     
-    # 1. Alapterület / Telekméret keresése (pl. 54 m², 120 m2, 450 nm)
+    # 1. Alapterület / Telekméret keresése
     meret_match = re.search(r'(\d+[\d\s]*)\s*(m²|m2|nm)', szoveg_low)
     size_num = None
     telekmeret = "Nincs információ"
@@ -45,7 +45,7 @@ def kinyer_extra_infok(szoveg, kikialtasi_ar):
             if clean_size:
                 size_num = int(clean_size)
                 telekmeret = f"{size_num:,} m²"
-        except:
+        except Exception:
             pass
         
     minimal_ar = "Nincs megadva"
@@ -94,7 +94,7 @@ def load_and_update_config():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             try:
                 config = json.load(f)
-            except:
+            except Exception:
                 pass
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -160,7 +160,7 @@ def main():
                 viewport={"width": 1280, "height": 3000}
             )
             page = context.new_page()
-            page.goto(target_url, wait_until="networkidle", timeout=60000)
+            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(4000)
             
             print("--> Szakaszos mélygörgetés...")
@@ -213,7 +213,8 @@ def main():
                 telepules = lines[0]
                 cim = lines[1] if len(lines) > 1 and "Ft" not in lines[1] else telepules
                 
-                clean_id = "".join(filter(str.isalnum, href.split("/")[-1]))
+                # ID generálása perjelek levágásával, hogy a -1 index ne legyen üres
+                clean_id = "".join(filter(str.isalnum, href.strip("/").split("/")[-1]))
                 if not clean_id:
                     clean_id = "".join(filter(str.isalnum, cim))[:20] + f"_{kikialtasi_ar}"
                     
@@ -236,7 +237,7 @@ def main():
                     "telekmeret": t_meret,
                     "nm_ar": nm_ar
                 })
-            except:
+            except Exception:
                 continue
 
     # B-TERV (Szöveges törzs alapján)
@@ -275,7 +276,7 @@ def main():
                     "telekmeret": t_meret,
                     "nm_ar": nm_ar
                 })
-            except:
+            except Exception:
                 continue
 
     print(f"📊 Megmaradt szűrt ingatlanok száma: {len(arveresek)}")
@@ -293,11 +294,16 @@ def main():
             kategoria_nev = config['keyword'].upper()
             max_ar_formazott = f"{config['max_ar']:,} Ft"
 
+            # Kiegészítve a hiányzó extra adatokkal
             üzenet = (
-                f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* \n\n"
+                f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* (`{kategoria_nev}` | `{max_ar_formazott}` alatt)\n\n"
                 f"📍 *Település:* {prop['telepules']}\n"
                 f"🏠 *Cím:* {prop['cim']}\n"
                 f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
+                f"📈 *Aktuális licit:* {prop['aktualis_licit']}\n"
+                f"📉 *Minimum ár:* {prop['minimal_ar']}\n"
+                f"📐 *Telekméret / Alapterület:* {prop['telekmeret']}\n"
+                f"🧮 *Négyzetméterár:* {prop['nm_ar']}\n\n"
                 f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
                 f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
             )
