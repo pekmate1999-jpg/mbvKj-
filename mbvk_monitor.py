@@ -99,8 +99,8 @@ def main():
 # A GitHubon a 'print' logok segítenek látni, mi történik
 print(f"DEBUG: Jelenlegi adatbázis mérete: {len(old_records)} tétel.")
 
-    # Konfiguráció betöltése (Telegram vezérlés)
-    config = load_and_update_config()
+    # Konfiguráció betöltése (Telegram vezérlés) 
+config = load_and_update_config()
     print(f"🔍 Aktív szűrés -> Kulcsszó: '{config['keyword']}', Max ár: {config['max_ar']:,} Ft")
     
     # A tágabb listát kérjük le, hogy a Python szűrhessen
