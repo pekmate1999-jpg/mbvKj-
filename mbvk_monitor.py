@@ -286,22 +286,22 @@ def main():
             keresendo_cim = f"{prop['telepules']} {prop['cim']}".replace("...", "").strip()
             maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(keresendo_cim)}"
 
-            # Dinamikus fejléc a konkrét szűrési adatokkal kibővítve
-kategoria_nev = config['keyword'].upper()
-max_ar_formazott = f"{config['max_ar']:,} Ft"
+            # Itt javítottam ki a behúzást (szigorúan a cikluson belülre kerültek a sorok):
+            kategoria_nev = config['keyword'].upper()
+            max_ar_formazott = f"{config['max_ar']:,} Ft"
 
-üzenet = (
-    f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* (`{kategoria_nev}` | `{max_ar_formazott}` alatt)\n\n"
-    f"📍 *Település / Régió:* {prop['telepules']}\n"
-    f"🏠 *Cím:* {prop['cim']}\n"
-    f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
-    f"📈 *Aktuális licit:* {prop['aktualis_licit']}\n"
-    f"📉 *Minimum ár:* {prop['minimal_ar']}\n"
-    f"📐 *Telekméret / Alapterület:* {prop['telekmeret']}\n"
-    f"🧮 *Négyzetméterár:* {prop['nm_ar']}\n\n"
-    f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
-    f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
-)
+            üzenet = (
+                f"🚨 *ÚJ TALÁLAT A SZŰRŐD ALAPJÁN!* (`{kategoria_nev}` | `{max_ar_formazott}` alatt)\n\n"
+                f"📍 *Település / Régió:* {prop['telepules']}\n"
+                f"🏠 *Cím:* {prop['cim']}\n"
+                f"💰 *Kikiáltási ár:* {prop['ar']:,} HUF\n"
+                f"📈 *Aktuális licit:* {prop['aktualis_licit']}\n"
+                f"📉 *Minimum ár:* {prop['minimal_ar']}\n"
+                f"📐 *Telekméret / Alapterület:* {prop['telekmeret']}\n"
+                f"🧮 *Négyzetméterár:* {prop['nm_ar']}\n\n"
+                f"🗺️ [Megtekintés Google Maps-en]({maps_url})\n"
+                f"🔗 [Ugrás az ingatlan adatlapjára]({prop['link']})"
+            )
             send_telegram_message(üzenet)
 
     if new_found_count > 0:
@@ -309,7 +309,6 @@ max_ar_formazott = f"{config['max_ar']:,} Ft"
         print(f"💾 {new_found_count} új tétel elmentve.")
     else:
         print("😴 Nincs új találat.")
-        # Ide is bekerült a pontosított kategória visszajelzésként
         send_telegram_message(f"✅ *Futtatás sikeres.*\n🔍 *Aktív szűrőcsoport:* `{config['keyword'].upper()}` | `{config['max_ar']:,} Ft` alatt.\n❌ Új tárgy nem érkezett.")
 
 if __name__ == "__main__":
