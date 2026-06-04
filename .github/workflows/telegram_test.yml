@@ -1,0 +1,26 @@
+name: Telegram Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send test message
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="✅ MBVK Monitor Telegram teszt - működik! $(date)" \
+            -d parse_mode="Markdown")
+          echo "Válasz: $RESPONSE"
+          echo "$RESPONSE" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+if r.get('ok'):
+    print('SIKERES: üzenet elküldve')
+else:
+    print('HIBA:', r.get('description'))
+    sys.exit(1)
+"
