@@ -501,6 +501,15 @@ def send_telegram(data: Dict):
     hanyad_str = hanyad                                 if hanyad   else None
     end_str    = end if end and end != "N/A"            else None
     dist_str   = f"{dist_km:.0f} km"                   if dist_km is not None else None
+# ... (A korábbi változódeklarációid: price_str, legh_str, stb. után) ...
+
+    # 👇 ITT GENERÁLJUK LE AZ ÚJ INFÓT
+    timeline = generate_timeline(
+        data.get("arveres_kezdete", ""),
+        data.get("arveres_vege", ""),
+        data.get("kikialtas_ar"),
+        data.get("minimum_ar")
+    )
 
     lines = ["🏠 *ÚJ MBVK TALÁLAT*", ""]
 
@@ -525,9 +534,13 @@ def send_telegram(data: Dict):
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad_str}")
     if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
+        
+    # 👇 EZT A SORT SZÚRD BE AZ IDŐVONALHOZ
+    lines.append(f"📊 *Státusz:* {timeline}")
+    
     if leiras:
         lines.append(f"\n📝 _{leiras}_")      
-      lines.append(f"⏳ *Idővonal:*\n{timeline}")
+        
     lines.append("")
     lines.append(f"🔗 [Részletek az MBVK oldalon]({data.get('url', '')})")
     if maps_url:
