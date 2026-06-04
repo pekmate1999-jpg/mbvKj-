@@ -36,6 +36,6 @@ jobs:
         run: |
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
-          git add mbvk_v7.db
+          git add mbvk_v8.db
           # Ha történt változás az adatbázisban, elmenti és visszatölti a repóba
           git diff --quiet && git diff --staged --quiet || (git commit -m "Update database [skip ci]" && git push)
