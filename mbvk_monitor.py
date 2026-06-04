@@ -377,11 +377,9 @@ def run():
     new_count = notified_count = 0
 
     for item in items:
-        # Az exec_id és auction_id kinyerése a lista elemből
-        exec_id    = (item.get("auctionId") or item.get("vegrehajtoid") or
-                      item.get("executionId") or item.get("id") or "")
-        auction_id = (item.get("auctionItemId") or item.get("itemId") or
-                      item.get("auction_item_id") or item.get("azonosito") or "")
+      # Az exec_id és auction_id kinyerése a lista elemből
+        exec_id    = str(item.get("auctionId") or "")
+        auction_id = str(item.get("id") or "")
 
         log.info("Lista elem kulcsok: %s", list(item.keys()))
 
