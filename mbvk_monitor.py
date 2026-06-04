@@ -74,22 +74,29 @@ log = logging.getLogger(__name__)
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
-    # Csak az árat és az azonosítókat kezeljük
+    # Alap tábla létrehozása, ha teljesen szűz lenne az adatbázis
     conn.execute("""
         CREATE TABLE IF NOT EXISTS properties (
             auction_id  TEXT PRIMARY KEY,
-            created_at  TEXT NOT NULL,
+            created_at  TEXT,
             notified_at TEXT,
-            price       INTEGER       -- aktuális ár (legmagasabb licit vagy minimum ár)
+            price       INTEGER
         )
     """)
+    # Létező oszlopok lekérése a meglévő adatbázisból
     cols = {row[1] for row in conn.execute("PRAGMA table_info(properties)")}
+    
+    # 👇 HA HIÁNYZIK VALAMELYIK OSZLOP A RÉGI ADATBÁZISODBÓL, ITT AUTOMATIKUSAN HOZZÁADJUK
+    if "created_at" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN created_at TEXT")
+        log.info("DB séma frissítve: created_at oszlop hozzáadva")
     if "notified_at" not in cols:
         conn.execute("ALTER TABLE properties ADD COLUMN notified_at TEXT")
         log.info("DB séma frissítve: notified_at oszlop hozzáadva")
     if "price" not in cols:
         conn.execute("ALTER TABLE properties ADD COLUMN price INTEGER")
         log.info("DB séma frissítve: price oszlop hozzáadva")
+        
     return conn
 
 # ── Segédfüggvények ───────────────────────────────────────────────────────────
