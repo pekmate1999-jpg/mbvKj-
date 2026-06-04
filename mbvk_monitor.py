@@ -160,68 +160,48 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[dict]
 
 
 def extract(data: dict) -> dict:
-    """
-    Kinyeri a szükséges mezőket az API 'data' objektumából.
-    Módosítva: kezeli a propertyAttributes listát és a propertyAddress szótárat.
-    """
+    """Kinyeri a mezőket, kezelve a propertyAttributes listát."""
+    
+    # Debug: írjuk ki, mik a kulcsok, ha elakadunk
+    attrs = data.get("propertyAttributes", [])
     
     def get_from_attrs(key_to_find):
         """Keresés a propertyAttributes listában."""
-        attrs = data.get("propertyAttributes", [])
         if isinstance(attrs, list):
             for attr in attrs:
-                if isinstance(attr, dict) and attr.get("key") == key_to_find:
+                if isinstance(attr, dict) and str(attr.get("key")).lower() == str(key_to_find).lower():
                     return attr.get("value")
         return None
 
     def g(*keys):
         for k in keys:
-            # 1. Közvetlen keresés
+            # 1. Közvetlen keresés a gyökérben
             if k in data: return data[k]
-            
-            # 2. propertyAttributes keresés
-            val = get_from_attrs(k)
-            if val is not None and str(val).strip() not in ("", "null", "None"):
-                return val
-            
-            # 3. propertyAddress keresés
+            # 2. propertyAddress keresés
             addr = data.get("propertyAddress", {})
-            if isinstance(addr, dict) and k in addr:
-                return addr[k]
+            if isinstance(addr, dict) and k in addr: return addr[k]
+            # 3. propertyAttributes keresés
+            val = get_from_attrs(k)
+            if val is not None: return val
         return None
 
-    # Megye (próbáljuk a 'county'-t az attribútumokból vagy a címből)
-    # Megye keresése API-ból
-    megye = g("county", "megye", "varmegye", "countyName")
-    telepules = g("city", "telepules", "cityName", "addressCity")
+    # Megye és Település
+    megye = g("county", "megye", "varmegye", "countyName", "addressCounty")
+    telepules = g("city", "telepules", "cityName", "addressCity", "settlement")
 
-    # HA NINCS MEGYE, de van település -> keressük ki a szótárból
+    # CSV alapú megye kiegészítés (ha az API nem adta vissza)
     if not megye and telepules:
-        norm_telepules = normalize(str(telepules))
-        if norm_telepules in TELEPULES_MAP:
-            megye = TELEPULES_MAP[norm_telepules]
-            log.info("Megye kiegészítve szótárból: %s -> %s", telepules, megye)
+        norm_t = normalize(str(telepules))
+        if norm_t in TELEPULES_MAP:
+            megye = TELEPULES_MAP[norm_t]
+            log.info("Megye kiegészítve CSV-ből: %s -> %s", telepules, megye)
     
-    # Település
-    telepules = g("city", "telepules", "cityName", "addressCity")
-
-    # Cím
-    cim = g("address", "cim", "fullAddress", "ingatlanCim")
-    if not cim and telepules:
-        cim = str(telepules)
-
-    # Tulajdoni hányad
-    hanyad = g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad")
-
-    # Beköltözhető (A log alapján ezeket a kulcsokat kell keresni)
-    bek_raw = g("isFree", "bekoltözheto", "bekoltozheto", "movable", "isFreeToMove")
-    if str(bek_raw).lower() in ("true", "1", "igen", "yes"):
-        bekoltözhető = "igen"
-    else:
-        bekoltözhető = "nem"
+    # Beköltözhető (a log alapján gyakran 'isFree' vagy hasonló kulcs)
+    bek_raw = g("isFree", "bekoltözheto", "bekoltozheto", "movable", "isFreeToMove", "szabad")
+    bekoltözhető = "igen" if str(bek_raw).lower() in ("true", "1", "igen", "yes") else "nem"
 
     # Árak
-    kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
+    kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr", "openingPrice"))
     minimum_ar        = parse_price(g("minPrice", "minimumAr", "minimumBid"))
     legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
     
@@ -230,8 +210,8 @@ def extract(data: dict) -> dict:
     return {
         "megye":            str(megye) if megye else None,
         "telepules":        str(telepules) if telepules else None,
-        "cim":              str(cim) if cim else "N/A",
-        "tulajdoni_hanyad": str(hanyad) if hanyad else None,
+        "cim":              str(g("address", "fullAddress", "cim", "location")) or "N/A",
+        "tulajdoni_hanyad": str(g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad")) if g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad") else None,
         "bekoltözhető":     bekoltözhető,
         "price":            price,
         "url":              data.get("url", ""),
@@ -321,34 +301,55 @@ def send_telegram(data: dict):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 
 def run():
-   def run():
-    load_telepules_map() # Itt töltjük be a 3000 sort egyszer
+    load_telepules_map() # Itt töltjük be a CSV-t
     log.info("MBVK Monitor inditas – %s", datetime.now().isoformat())
     conn = init_db()
-    # ... a többi kód ...
-
+    
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # ── 1. Lista lekérése API-ból ──
+    # ── 1. Lista lekérése ──
     items = []
     offset = 0
     while True:
         batch = api_list(session, offset=offset, limit=100)
-        if not batch:
-            break
+        if not batch: break
         items.extend(batch)
-        if len(batch) < 100:
-            break
+        if len(batch) < 100: break
         offset += 100
         time.sleep(0.5)
 
     log.info("Összesen %d árverés a listában", len(items))
 
-    if not items:
-        log.warning("Üres lista – kilépés")
-        conn.close()
-        return
+    for item in items:
+        exec_id    = str(item.get("auctionId") or "")
+        auction_id = str(item.get("id") or "")
+        
+        if not auction_id: continue
+        
+        if not is_new(conn, auction_id): continue
+
+        detail = api_detail(session, exec_id, auction_id)
+        if not detail:
+            mark_seen(conn, auction_id)
+            continue
+
+        data = extract(detail)
+        data["auction_id"] = auction_id
+        data["url"]        = f"{BASE_URL}/arveres-reszletek/{exec_id}/{auction_id}"
+
+        log.info("Feldolgozva: %s | megye=%s | beköltözhető=%s", 
+                 auction_id, data.get("megye"), data.get("bekoltözhető"))
+
+        if passes_filters(data):
+            log.info("SZŰRŐN ÁTMENT: %s", auction_id)
+            send_telegram(data)
+
+        mark_seen(conn, auction_id)
+        time.sleep(0.5)
+
+    conn.close()
+    
 
     new_count = notified_count = 0
 
