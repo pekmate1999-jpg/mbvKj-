@@ -139,20 +139,6 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[dict]
         return None
 
 
-def api_licit(session: requests.Session, exec_id, auction_id) -> dict:
-    """Lekéri a licit adatokat."""
-    url = f"{API_BASE}/auction/licit/{exec_id}/{auction_id}?page=1"
-    try:
-        r = session.get(url, timeout=20)
-        r.raise_for_status()
-        body = r.json()
-        return body
-    except Exception as exc:
-        log.warning("Licit API hiba: %s", exc)
-        return {}
-
-# ── Adatkinyerés ──────────────────────────────────────────────────────────────
-
 def extract(data: dict) -> dict:
     """
     Kinyeri a szükséges mezőket az API 'data' objektumából.
@@ -162,89 +148,97 @@ def extract(data: dict) -> dict:
 
     def g(*keys):
         for k in keys:
-            # Közvetlen kulcs
+            # 1. Közvetlen kulcs keresése a gyökérben
             v = data.get(k)
             if v is not None and str(v).strip() not in ("", "null", "None"):
                 return v
-            # Beágyazott objektumokban keresés
+            
+            # 2. Beágyazott objektumokban (pl. propertyAddress) keresés
             for dk, dv in data.items():
                 if isinstance(dv, dict):
                     v2 = dv.get(k)
                     if v2 is not None and str(v2).strip() not in ("", "null", "None"):
                         return v2
+                # 3. Listákban lévő objektumokban (pl. propertyAttributes) keresés
+                elif isinstance(dv, list):
+                    for item in dv:
+                        if isinstance(item, dict):
+                            v3 = item.get(k)
+                            if v3 is not None and str(v3).strip() not in ("", "null", "None"):
+                                return v3
         return None
 
-    # Megye
+    # Megye (Bővítve p_county és hasonlókkal)
     megye = g(
         "county", "megye", "varmegye", "countyName", "countyId",
-        "addressCounty", "address_county", "cityCounty",
+        "addressCounty", "address_county", "cityCounty", "p_county", "p_megye"
     )
-    # Ha az érték szám (ID), nem szöveg – próbáljuk a névmezőt
     if megye and str(megye).isdigit():
         megye = g("countyName", "countyLabel", "countyText", "varmegyeNev")
 
     # Település
     telepules = g(
         "city", "telepules", "settlement", "cityName", "town",
-        "addressCity", "address_city", "helyszin",
+        "addressCity", "address_city", "helyszin", "p_city", "p_telepules"
     )
 
     # Cím
     cim = g(
         "address", "cim", "fullAddress", "ingatlanCim",
-        "addressFull", "streetAddress", "location",
+        "addressFull", "streetAddress", "location", "p_address"
     )
     if not cim and telepules:
         cim = str(telepules)
 
-    # Tulajdoni hányad
+    # Tulajdoni hányad (HOZZÁADVA a logból kinyert p_tulajdonihanyad)
     hanyad = g(
-        "ownershipShare", "tulajdoniHanyad", "hanyad",
-        "ownership", "share", "tulajdoni_hanyad",
+        "p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad",
+        "ownership", "share", "tulajdoni_hanyad"
     )
 
-    # Beköltözhető
+    # Beköltözhető (Bővítve a lakott/beköltözhető kifejezések felismerésével)
     bek_raw = g(
-        "isFree", "bekoltözheto", "bekoltozheto", "movable",
-        "isFreeToMove", "isMovable", "szabad", "free",
+        "p_bekoltozheto", "bekoltozheto", "bekoltözheto", "isFree", "movable",
+        "isFreeToMove", "isMovable", "szabad", "free", "bekoltozhetoseg"
     )
     if bek_raw is None:
         bekoltözhető = None
-    elif str(bek_raw).lower() in ("true", "1", "igen", "yes"):
+    elif str(bek_raw).lower() in ("true", "1", "igen", "yes", "beköltözhető", "bekoltozheto"):
         bekoltözhető = "igen"
-    elif str(bek_raw).lower() in ("false", "0", "nem", "no"):
+    elif str(bek_raw).lower() in ("false", "0", "nem", "no", "lakott"):
         bekoltözhető = "nem"
     else:
         bekoltözhető = str(bek_raw).lower()
 
-    # Árak
-    kikialtas_ar     = parse_price(g("startPrice", "kikialtasiAr", "openingPrice", "startingPrice"))
-    minimum_ar       = parse_price(g("minimumPrice", "minimumAr", "minPrice", "minBid", "minimumBid"))
-    legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit", "maxBid", "currentPrice"))
+    # Árak (HOZZÁADVA a putUpPrice és minPrice a log alapján)
+    kikialtas_ar     = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr", "openingPrice"))
+    minimum_ar       = parse_price(g("minPrice", "minimumPrice", "minimumAr", "minBid"))
+    legmagasabb_licit = parse_price(g("highestBid", "currentBid", "legmagasabbLicit", "maxBid"))
     licitek_szama_raw = g("bidCount", "licitekSzama", "numberOfBids", "bidNumber")
     licitek_szama    = int(str(licitek_szama_raw)) if licitek_szama_raw and str(licitek_szama_raw).isdigit() else 0
 
-    # Árverés vége
+    # Árverés vége (HOZZÁADVA az auctionEndDate)
     arveres_vege = g(
-        "endDate", "auctionEnd", "arveresVege", "closingDate",
-        "endDateTime", "vegeDatuma", "lezarasDatuma", "closeDate",
+        "auctionEndDate", "endDate", "auctionEnd", "arveresVege", "closingDate",
+        "endDateTime", "vegeDatuma"
     )
 
     # Telekméret
     telek_raw = g(
         "plotArea", "telekMeret", "landArea", "plotSize",
-        "terulet", "telekTerulet", "area", "landSize",
+        "terulet", "telekTerulet", "area", "landSize", "p_telekmeret"
     )
     telekmeret = parse_area(telek_raw)
 
     # Épület méret
     ep_raw = g(
         "floorArea", "epuletMeret", "buildingArea", "livingArea",
-        "alapterulet", "usableArea", "netArea",
+        "alapterulet", "usableArea", "netArea", "p_alapterulet"
     )
     epulet_meret = parse_area(ep_raw)
 
-    price = legmagasabb_licit or minimum_ar
+    # Ha nincs legmagasabb licit, akkor a minimum árat, ha az sincs, a kikiáltási árat vesszük alapul
+    price = legmagasabb_licit or minimum_ar or kikialtas_ar
     ft_per_m2 = round(price / telekmeret) if price and telekmeret and telekmeret > 0 else None
 
     return {
