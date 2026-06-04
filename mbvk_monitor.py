@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Optional
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+#from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ── Konfiguráció ──────────────────────────────────────────────────────────────
 
