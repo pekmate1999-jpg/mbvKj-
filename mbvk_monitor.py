@@ -258,7 +258,63 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
     except Exception as exc:
         log.warning("Részlet API hiba (%s/%s): %s", exec_id, auction_id, exc)
         return None
+def generate_timeline(kezdete: str, vege: str, kiki_ar: Optional[int], min_ar: Optional[int]) -> str:
+    import datetime
+    
+    # 1. Időalapú haladás kiszámítása
+    try:
+        s_str = kezdete.split("T")[0].split()[0].replace(".", "-").strip("-")
+        e_str = vege.split("T")[0].split()[0].replace(".", "-").strip("-")
+        start_dt = datetime.datetime.strptime(s_str, "%Y-%m-%d")
+        end_dt = datetime.datetime.strptime(e_str, "%Y-%m-%d")
+        now_dt = datetime.datetime.now()
+    except Exception:
+        return "`[░░░░░|░░░░░|░░░░░]`\n_Ismeretlen időszak_"
 
+    total_sec = (end_dt - start_dt).total_seconds()
+    if total_sec <= 0:
+        return "`[█████|█████|█████]`\n_Lezárult_"
+
+    elapsed = (now_dt - start_dt).total_seconds()
+    progress = max(0.0, min(1.0, elapsed / total_sec))
+    
+    # Vizuális sáv generálása
+    filled = int(progress * 15)
+    blocks = ["█" if i < filled else "░" for i in range(15)]
+    stage1, stage2, stage3 = "".join(blocks[0:5]), "".join(blocks[5:10]), "".join(blocks[10:15])
+    
+    # 2. Szakasz intelligens becslése
+    if progress < 0.333:
+        time_stage = 1
+    elif progress < 0.666:
+        time_stage = 2
+    else:
+        time_stage = 3
+        
+    price_stage = time_stage
+    ratio_text = ""
+    
+    # Ár-arány vizsgálata (ha van minimum és kikiáltási ár is)
+    if kiki_ar and min_ar and kiki_ar > 0:
+        ratio = min_ar / kiki_ar
+        ratio_text = f" ({int(ratio * 100)}%)"
+        
+        # Ha az arány alapján egyértelműen másik szakaszban van
+        if ratio >= 0.95:
+            price_stage = 1
+        elif ratio >= 0.75:
+            price_stage = 2
+        elif ratio < 0.75:
+            price_stage = 3
+            
+    # A legelőrehaladottabb állapotot vesszük figyelembe
+    final_stage = max(time_stage, price_stage)
+    
+    pct = int(progress * 100)
+    bar = f"`[{stage1}|{stage2}|{stage3}]` {pct}%"
+    status = f"*{final_stage}. szakasz{ratio_text}*"
+    
+    return f"{bar}\n{status}"
 # ── Adatkinyerés ──────────────────────────────────────────────────────────────
 def extract(data: Dict) -> Dict:
     def g(*keys):
@@ -335,6 +391,7 @@ def extract(data: Dict) -> Dict:
     ft_per_m2 = int(price / ref_area) if price and ref_area and ref_area > 0 else None
 
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
+    arveres_kezdete = g("auctionStartDate", "startDate", "auctionStart", "kezdet", "kibocsatasDatuma")
 
     return {
         "megye":              megye,
@@ -343,6 +400,8 @@ def extract(data: Dict) -> Dict:
         "tulajdoni_hanyad":   hanyad,
         "bekoltözhető":       "igen",
         "price":              price,
+        "kikialtas_ar":       kikialtas_ar,
+        "minimum_ar":         minimum_ar,
         "legmagasabb_licit":  legmagasabb_licit,
         "licitek_szama":      licit_szam,
         "telek_meret":        telek_meret,
@@ -350,6 +409,7 @@ def extract(data: Dict) -> Dict:
         "epulet_meret":       epulet_meret,
         "epulet_forras":      "api" if epulet_api else ("leiras" if epulet_leiras else None),
         "ft_per_m2":          ft_per_m2,
+        "arveres_kezdete":    arveres_kezdete or "N/A",
         "arveres_vege":       arveres_vege or "N/A",
         "leiras":             leiras,
         "url":                data.get("url", ""),
@@ -466,8 +526,8 @@ def send_telegram(data: Dict):
     if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
     if leiras:
-        lines.append(f"\n📝 _{leiras}_")
-
+        lines.append(f"\n📝 _{leiras}_")      
+      lines.append(f"⏳ *Idővonal:*\n{timeline}")
     lines.append("")
     lines.append(f"🔗 [Részletek az MBVK oldalon]({data.get('url', '')})")
     if maps_url:
