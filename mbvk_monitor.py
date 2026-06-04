@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v4 – Beköltözhető ingatlanok (moveln=true)
+MBVK Árverési Monitor v4.2 – Beköltözhető ingatlanok (moveln=true)
 Szűrés: tulajdoni hányad (1/1 vagy 1/2+1/2) és max ár 1M Ft
 
-Új funkciók (v4):
-  1. Budapest-távolság: geopy alapján, Nominatim geocoder
-  2. Google Térkép link a Telegram üzenetben
-  3. Duplikáció-mentes értesítés: SQLite notified_at oszloppal
-  4. Leírás kinyerése (max 200 kar.) + telekméret regex a leírásból
-
-Telepítés:
-  pip install requests geopy
+Javítások (v4.2):
+  - Robusztus telek- és épületméret kinyerés leírásból generikus m2 keresővel.
+  - Ha 2 méret van: nagyobb = telek, kisebb = épület.
+  - Ha 1 méret van: környezeti kulcsszó-pontozás alapján dönt.
 """
 
 import csv
@@ -76,14 +72,8 @@ log = logging.getLogger(__name__)
 
 # ── SQLite ────────────────────────────────────────────────────────────────────
 def init_db() -> sqlite3.Connection:
-    """
-    Tábla sémája:
-      auction_id  – elsődleges kulcs (duplikáció-védelem)
-      created_at  – első megtalálás ideje
-      notified_at – mikor ment ki a Telegram értesítés (NULL = nem ment)
-    """
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit
-    conn.execute("PRAGMA journal_mode=WAL")                # párhuzamos írás-véd.
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS properties (
             auction_id  TEXT PRIMARY KEY,
@@ -91,7 +81,6 @@ def init_db() -> sqlite3.Connection:
             notified_at TEXT
         )
     """)
-    # Régi séma (v3) frissítése ha szükséges
     cols = {row[1] for row in conn.execute("PRAGMA table_info(properties)")}
     if "notified_at" not in cols:
         conn.execute("ALTER TABLE properties ADD COLUMN notified_at TEXT")
@@ -99,30 +88,26 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 def is_new(conn: sqlite3.Connection, auction_id: str) -> bool:
-    """Igaz, ha az aukció még soha nem szerepelt az adatbázisban."""
     row = conn.execute(
         "SELECT 1 FROM properties WHERE auction_id = ?", (auction_id,)
     ).fetchone()
     return row is None
 
 def already_notified(conn: sqlite3.Connection, auction_id: str) -> bool:
-    """Igaz, ha már küldtünk értesítést erről az aukcióról."""
     row = conn.execute(
         "SELECT notified_at FROM properties WHERE auction_id = ?", (auction_id,)
     ).fetchone()
     if row is None:
         return False
-    return row[0] is not None  # notified_at ki van töltve
+    return row[0] is not None
 
 def mark_seen(conn: sqlite3.Connection, auction_id: str):
-    """Felveszi az aukciót az adatbázisba (értesítés nélkül)."""
     conn.execute(
         "INSERT OR IGNORE INTO properties (auction_id, created_at) VALUES (?, ?)",
         (auction_id, datetime.utcnow().isoformat()),
     )
 
 def mark_notified(conn: sqlite3.Connection, auction_id: str):
-    """Beállítja a notified_at időbélyeget – duplikáció-védelem."""
     now = datetime.utcnow().isoformat()
     conn.execute(
         """INSERT INTO properties (auction_id, created_at, notified_at)
@@ -143,7 +128,6 @@ def parse_price(val) -> Optional[int]:
     return int(digits) if digits else None
 
 def parse_area(val) -> Optional[float]:
-    """Számot keres egy szövegből (m² értékhez)."""
     if val is None:
         return None
     s = str(val).strip()
@@ -155,73 +139,86 @@ def parse_area(val) -> Optional[float]:
             pass
     return None
 
-# ── Telek- és épületméret kinyerése a leírásból (v4.1) ────────────────────────
+# ── Telek- és épületméret kinyerése a leírásból (v4.2 - JAVÍTOTT) ─────────────
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    Két különböző méretet keres a leírás szövegéből:
-      • telek_m2  – telek, udvar, terület, ingatlan nagysága
-      • epulet_m2 – ház, lakás, épület, alapterület (belső lakótér)
-
-    Visszatér: (telek_m2, epulet_m2) – mindkettő None ha nem találja.
+    Keresi a méreteket a leírás szövegéből (m² vagy m2 alapján).
+    Szabály: Ha a leírás 2 különböző méretet tartalmaz, a nagyobb a telek, 
+    a kisebb pedig az épület mérete.
     """
     if not desc:
         return None, None
 
-    NUM = r"([\d][\d\s]*(?:[.,][\d]+)?)"   # számcsoport, ezres-szóközök megengedve
+    # Minden olyan számcsoport keresése, amit m² vagy m2 követ (ezres szóközök támogatásával)
+    pattern = r"([\d][\d\s]*(?:[.,][\d]+)?)\s*m[²2]"
+    
+    matches = []
+    for m in re.finditer(pattern, desc, re.IGNORECASE):
+        num_str = m.group(1).replace(" ", "").replace(",", ".")
+        try:
+            val = float(num_str)
+            # Reális méreghatárok kiszűrése (pl. elírások vagy helyrajzi számok elkerülésére)
+            if 5 <= val <= 250_000:
+                matches.append((val, m.start(), m.end()))
+            elif val > 250_000:
+                # Ha túl nagy szám (pl. hrsz van m2-nek írva), átugorjuk
+                continue
+        except (ValueError, TypeError):
+            continue
 
-    def first_match(patterns: list) -> Optional[float]:
-        """Az összes pattern közt a szövegben legkorábban illeszkedőt adja vissza."""
-        best_pos, best_val = len(desc) + 1, None
-        for pat in patterns:
-            for m in re.finditer(pat, desc, re.IGNORECASE):
-                # Az első nem-None capture group
-                grp = next(
-                    (m.group(i) for i in range(1, (m.lastindex or 0) + 1) if m.group(i)),
-                    None,
-                )
-                if grp is None:
-                    continue
-                try:
-                    val = float(grp.replace(" ", "").replace(",", "."))
-                    if 5 <= val <= 200_000 and m.start() < best_pos:
-                        best_pos, best_val = m.start(), val
-                except (ValueError, TypeError):
-                    pass
-        return best_val
+    if not matches:
+        return None, None
 
-    # ── TELEKRE utaló minták ──────────────────────────────────────────────────
-    telek_patterns = [
-        rf"{NUM}\s*m[²2]\s+(?:alapter[üu]leten|ter[üu]leten)\b",
-        rf"(?:telek|udvar)\s*(?:m[eé]ret[e]?|nagys[áa]g[a]?|ter[üu]lete?)?\s*:?\s*{NUM}\s*m[²2]",
-        rf"{NUM}\s*m[²2]\s*(?:telek|udvar)\b",
-        rf"(?:udvar|telek)\s+ter[üu]lete\s*:?\s*{NUM}\s*m[²2]",
-        rf"ingatlan\s*ter[üu]lete\s*:?\s*{NUM}\s*m[²2]",
-        rf"\bter[üu]let\s*:?\s*{NUM}\s*m[²2]",
-    ]
+    # Egyedi értékek kigyűjtése az előfordulás sorrendjében
+    unique_vals = []
+    for val, _, _ in matches:
+        if val not in unique_vals:
+            unique_vals.append(val)
 
-    # ── ÉPÜLETRE utaló minták ─────────────────────────────────────────────────
-    epulet_patterns = [
-        rf"alapter[üu]lete\s*:?\s*{NUM}\s*m[²2]",
-        rf"{NUM}\s*m[²2]\s*alapter[üu]let[ű]",
-        rf"(?:h[aá]z|lak[aá]s|[eé]p[üu]let|lak[oó]ingatlan)\s*alapter[üu]lete?\s*:?\s*{NUM}\s*m[²2]",
-        rf"(?:lak[oó]ter[üu]let|net[oó]ter[üu]let|alapter[üu]let)\s*:?\s*{NUM}\s*m[²2]",
-        rf"(?:h[aá]z|lak[aá]s)\s+alapter[üu]lete\s+{NUM}\s*m[²2]",
-    ]
+    telek_m2 = None
+    epulet_m2 = None
 
-    return first_match(telek_patterns), first_match(epulet_patterns)
+    if len(unique_vals) >= 2:
+        # FONTOS FELHASZNÁLÓI SZABÁLY: nagyobb = telek, kisebb = épület alapterület
+        unique_vals.sort()
+        epulet_m2 = unique_vals[0]
+        telek_m2 = unique_vals[-1]
+    elif len(unique_vals) == 1:
+        # Ha csak egy méretet találtunk, környezeti kulcsszavak alapján döntünk
+        val = unique_vals[0]
+        first_match_info = next(m for m in matches if m[0] == val)
+        start_pos = first_match_info[1]
+        end_pos = first_match_info[2]
+        
+        # Környező kontextus vizsgálata (60-60 karakter előtte és utána)
+        window_start = max(0, start_pos - 60)
+        window_end = min(len(desc), end_pos + 60)
+        context = desc[window_start:window_end].lower()
+        
+        epulet_kws = ["alapterület", "ház", "lakás", "épület", "lakóingatlan", "lakóház", "beépített"]
+        telek_kws = ["telek", "udvar", "terület", "területe", "földrészlet", "kivett", "szántó", "beépítetlen"]
+        
+        epulet_score = sum(1 for kw in epulet_kws if kw in context)
+        telek_score = sum(1 for kw in telek_kws if kw in context)
+        
+        if epulet_score > telek_score:
+            epulet_m2 = val
+        elif telek_score > epulet_score:
+            telek_m2 = val
+        else:
+            # Ha teljesen döntetlen vagy nem egyértelmű, egy reális méretküszöb dönt (pl. 250 m2 felett valószínűleg telek)
+            if val > 250:
+                telek_m2 = val
+            else:
+                epulet_m2 = val
+
+    return telek_m2, epulet_m2
 
 # ── Budapest-távolság (geopy) ─────────────────────────────────────────────────
-# Geocoder példány – egyszer hozzuk létre (Nominatim rate-limit: 1 req/s)
 _geocoder = Nominatim(user_agent="mbvk_monitor_v4") if GEOPY_OK else None
-_geocache: Dict[str, Optional[float]] = {}   # telepules → km
+_geocache: Dict[str, Optional[float]] = {}
 
 def bp_distance_km(telepules: Optional[str], cim: Optional[str] = None) -> Optional[float]:
-    """
-    Visszaadja a Budapest-távolságot km-ben a settlement neve alapján.
-    Cache-eli az eredményt, hogy ne hívja fel a Nominatim API-t kétszer
-    ugyanarra a városra.
-    Returns None ha geopy nincs telepítve vagy a geocoding sikertelen.
-    """
     if not GEOPY_OK or not _geocoder:
         return None
 
@@ -233,19 +230,16 @@ def bp_distance_km(telepules: Optional[str], cim: Optional[str] = None) -> Optio
     if key in _geocache:
         return _geocache[key]
 
-    # Nominatim-nek "Veszprém, Magyarország" stb. formátum a legjobb
     query = f"{lookup}, Magyarország"
     try:
-        time.sleep(1.1)   # Nominatim ToS: max 1 req/s
+        time.sleep(1.1)
         location = _geocoder.geocode(query, timeout=10)
         if location:
             coords = (location.latitude, location.longitude)
             dist = round(geodesic(BUDAPEST_COORDS, coords).kilometers, 1)
             _geocache[key] = dist
-            log.debug("Geocode OK: %s → %.1f km", lookup, dist)
             return dist
         else:
-            log.debug("Geocode nem találta: %s", lookup)
             _geocache[key] = None
             return None
     except Exception as exc:
@@ -255,7 +249,6 @@ def bp_distance_km(telepules: Optional[str], cim: Optional[str] = None) -> Optio
 
 # ── Google Térkép link ────────────────────────────────────────────────────────
 def google_maps_url(cim: Optional[str]) -> Optional[str]:
-    """Visszaad egy kattintható Google Térkép URL-t a megadott címre."""
     if not cim or cim == "N/A":
         return None
     encoded = quote_plus(cim)
@@ -269,7 +262,6 @@ HEADERS = {
 }
 
 def api_list(session: requests.Session, offset=0, limit=100) -> List[Dict]:
-    """Csak beköltözhető (moveln=true) ingatlanokat kérdez."""
     url = (f"{API_BASE}/auction/list"
            f"?offset={offset}&limit={limit}"
            f"&sortMod=feltolt&sortDirection=desc"
@@ -296,20 +288,9 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
         log.warning("Részlet API hiba (%s/%s): %s", exec_id, auction_id, exc)
         return None
 
-# ── Adatkinyerés (v4.1) ───────────────────────────────────────────────────────
+# ── Adatkinyerés ──────────────────────────────────────────────────────────────
 def extract(data: Dict) -> Dict:
-    """Kinyeri az összes fontos mezőt a részlet API válaszából."""
-
-    def get_from_attrs(group_key: str) -> Optional[str]:
-        """propertyAttributes listából keres attributesGroup alapján."""
-        attrs = data.get("propertyAttributes", [])
-        for attr in attrs:
-            if attr.get("attributesGroup") == group_key and attr.get("attribute"):
-                return attr.get("attributeName")
-        return None
-
     def g(*keys):
-        """Keres a data dict-ben, majd a propertyAddress első elemében."""
         addr_list = data.get("propertyAddress", [])
         addr = addr_list[0] if isinstance(addr_list, list) and addr_list else {}
         for k in keys:
@@ -319,17 +300,14 @@ def extract(data: Dict) -> Dict:
                 return addr[k]
         return None
 
-    # propertyAddress első eleme
     addr_list = data.get("propertyAddress", [])
     addr = addr_list[0] if isinstance(addr_list, list) and addr_list else {}
 
-    # Település és megye
     telepules = addr.get("settlement") or addr.get("city") or g("cityName", "addressCity")
     megye = g("county", "megye", "varmegye", "countyName")
     if not megye and telepules and normalize(str(telepules)) in TELEPULES_MAP:
         megye = TELEPULES_MAP[normalize(str(telepules))]
 
-    # Cím összerakása a valódi JSON mezőnevekkel
     cim_parts = []
     irsz = addr.get("zipCode") or addr.get("postCode")
     if irsz:
@@ -343,38 +321,32 @@ def extract(data: Dict) -> Dict:
     if cim_parts:
         cim = " ".join(cim_parts)
     else:
-        cim = (addr.get("formattedAddress")
-               or g("address", "cim", "fullAddress", "ingatlanCim")
-               or "N/A")
+        cim = (addr.get("formattedAddress") or g("address", "cim", "fullAddress", "ingatlanCim") or "N/A")
 
-    # Tulajdoni hányad
     hanyad = g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad")
 
-    # Árak
     kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
     minimum_ar        = parse_price(g("minPrice", "minimumAr", "minimumBid"))
     legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
     price = legmagasabb_licit or minimum_ar or kikialtas_ar
 
-    # Licitek száma
     licit_szam = g("bidCount", "licitekSzama")
     try:
         licit_szam = int(licit_szam) if licit_szam is not None else 0
     except (ValueError, TypeError):
         licit_szam = 0
 
-    # ── LEÍRÁS (max 200 karakter) ─────────────────────────────────────────────
     leiras_full = g("description", "leiras", "propertyDescription") or ""
     leiras = leiras_full[:200].rstrip() if leiras_full else ""
 
-    # ── MÉRETEK: strukturált API-mező, ha üres → regex a leírásból ───────────
+    # Szemantikus API mezők
     telek_api   = parse_area(g("landArea",  "totalArea", "telekmeret", "terulet"))
     epulet_api  = parse_area(g("builtArea", "area",      "alapterulet", "livingArea"))
 
     telek_leiras: Optional[float]  = None
     epulet_leiras: Optional[float] = None
 
-    # Ha legalább az egyiket nem sikerült az API-ból kinyerni, futtatjuk a regexet
+    # Ha az API válaszból bármelyik hiányzik, futtatjuk az új, robusztus regexet
     if telek_api is None or epulet_api is None:
         t_desc, e_desc = parse_sizes_from_description(leiras_full)
         if telek_api is None and t_desc is not None:
@@ -384,14 +356,12 @@ def extract(data: Dict) -> Dict:
             epulet_leiras = e_desc
             log.debug("Épületméret leírásból: %.0f m²", epulet_leiras)
 
-    telek_meret  = telek_api  or telek_leiras   # végleges értékek
+    telek_meret  = telek_api  or telek_leiras
     epulet_meret = epulet_api or epulet_leiras
 
-    # Ft/m² az épületméretre számítva (ha van); fallback: telekméret
     ref_area = epulet_meret or telek_meret
     ft_per_m2 = int(price / ref_area) if price and ref_area and ref_area > 0 else None
 
-    # Árverés vége
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
 
     return {
@@ -403,7 +373,6 @@ def extract(data: Dict) -> Dict:
         "price":              price,
         "legmagasabb_licit":  legmagasabb_licit,
         "licitek_szama":      licit_szam,
-        # Méretek – külön API- és leírás-forrással
         "telek_meret":        telek_meret,
         "telek_forras":       "api" if telek_api else ("leiras" if telek_leiras else None),
         "epulet_meret":       epulet_meret,
@@ -438,7 +407,6 @@ def passes_filters(data: Dict) -> bool:
     if not county_matches(data.get("megye")):
         return False
 
-    # Lejárt árverés kizárása
     end_date_str = data.get("arveres_vege")
     if end_date_str and end_date_str != "N/A":
         end_date = None
@@ -449,7 +417,6 @@ def passes_filters(data: Dict) -> bool:
             except ValueError:
                 continue
         if end_date and end_date < datetime.now():
-            log.debug("Lejárt árverés: %s", end_date_str)
             return False
 
     if not share_accepted(data.get("tulajdoni_hanyad")):
@@ -461,7 +428,7 @@ def passes_filters(data: Dict) -> bool:
 
     return True
 
-# ── Telegram (v4.1) ───────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(data: Dict):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram nincs beállítva (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID hiányzik)")
@@ -476,22 +443,16 @@ def send_telegram(data: Dict):
     leiras   = data.get("leiras", "")
     telepules = data.get("telepules")
 
-    # Méretek + forrás jelzés
     telek_m   = data.get("telek_meret")
-    telek_f   = data.get("telek_forras")    # "api" | "leiras" | None
+    telek_f   = data.get("telek_forras")
     epulet_m  = data.get("epulet_meret")
     epulet_f  = data.get("epulet_forras")
     ft_m2     = data.get("ft_per_m2")
 
-    # Budapest-távolság (geopy)
     dist_km = bp_distance_km(telepules, cim)
-
-    # Google Térkép link
     maps_url = google_maps_url(cim)
 
-    # ── Formázás ──────────────────────────────────────────────────────────────
     def fmt_area(val: Optional[float], forras: Optional[str]) -> Optional[str]:
-        """Pl. '1 349 m²' vagy '1 349 m² (leírásból)'"""
         if val is None:
             return None
         s = f"{val:,.0f} m²".replace(",", " ")
@@ -509,7 +470,6 @@ def send_telegram(data: Dict):
     end_str    = end if end and end != "N/A"            else None
     dist_str   = f"{dist_km:.0f} km"                   if dist_km is not None else None
 
-    # ── Üzenet összeállítása ──────────────────────────────────────────────────
     lines = ["🏠 *ÚJ MBVK TALÁLAT*", ""]
 
     if cim and cim != "N/A":
@@ -564,16 +524,14 @@ def send_telegram(data: Dict):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor v4.1 indítás – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor v4.2 indítás – %s", datetime.now().isoformat())
     if not GEOPY_OK:
-        log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető. "
-                    "Telepítés: pip install geopy")
+        log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
 
     conn = init_db()
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # ── Lista lekérése (csak beköltözhető tételek) ────────────────────────────
     items: List[Dict] = []
     offset = 0
     while True:
@@ -588,7 +546,6 @@ def run():
 
     log.info("Összesen %d beköltözhető árverés a listában", len(items))
     if not items:
-        log.warning("Nincs beköltözhető ingatlan a listában.")
         conn.close()
         return
 
@@ -600,17 +557,12 @@ def run():
         if not exec_id or not auction_id:
             continue
 
-        # ── Duplikáció-védelem (kétszintű) ────────────────────────────────────
-        # 1. szint: már ismert ÉS értesített → skip
         if already_notified(conn, auction_id):
-            log.debug("Már értesítve: %s", auction_id)
             continue
 
         url = f"{BASE_URL}/arveres-reszletek/{exec_id}/{auction_id}"
 
-        # 2. szint: már látott, de nem értesített (pl. szűrőn nem ment át) → skip
         if not is_new(conn, auction_id):
-            log.debug("Már ismert (nem értesített): %s", auction_id)
             continue
 
         new_count += 1
@@ -625,29 +577,22 @@ def run():
 
         log.info(
             "Feldolgozva: %s | %s | hányad=%s | ár=%s | telek=%s | épület=%s",
-            auction_id,
-            data.get("cim", "N/A"),
-            data.get("tulajdoni_hanyad"),
-            data.get("price"),
-            data.get("telek_meret"),
-            data.get("epulet_meret"),
+            auction_id, data.get("cim", "N/A"), data.get("tulajdoni_hanyad"),
+            data.get("price"), data.get("telek_meret"), data.get("epulet_meret"),
         )
 
         if passes_filters(data):
             log.info("✅ ÁTMENT: %s", auction_id)
             send_telegram(data)
-            mark_notified(conn, auction_id)   # értesítés ténye rögzítve
+            mark_notified(conn, auction_id)
             notified_count += 1
         else:
             log.info("❌ Nem ment át (szűrő): %s", auction_id)
-            mark_seen(conn, auction_id)       # látott, de NEM értesített
+            mark_seen(conn, auction_id)
 
         time.sleep(1)
 
-    log.info(
-        "Kész – Új: %d / Értesítés: %d / Összes beköltözhető: %d",
-        new_count, notified_count, len(items),
-    )
+    log.info("Kész – Új: %d / Értesítés: %d", new_count, notified_count)
     conn.close()
 
 if __name__ == "__main__":
