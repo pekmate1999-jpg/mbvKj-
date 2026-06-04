@@ -136,7 +136,7 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
         return None
 
 def extract(data: Dict) -> Dict:
-    """Kinyeri a szükséges mezőket (beköltözhetőséget nem kell ellenőrizni a szűrésben)."""
+    """Kinyeri a maximális számú fontos mezőt."""
     def get_from_attrs(key):
         attrs = data.get("propertyAttributes", [])
         for attr in attrs:
@@ -156,42 +156,72 @@ def extract(data: Dict) -> Dict:
                 return addr[k]
         return None
 
+    # Település és megye
     megye = g("county", "megye", "varmegye", "countyName")
     telepules = g("city", "telepules", "cityName", "addressCity")
     if not megye and telepules and normalize(str(telepules)) in TELEPULES_MAP:
         megye = TELEPULES_MAP[normalize(str(telepules))]
 
-    cim = g("address", "cim", "fullAddress", "ingatlanCim")
-    if not cim and telepules:
-        cim = str(telepules)
+    # Cím összerakása
+    cim_parts = []
+    addr = data.get("propertyAddress", {})
+    if isinstance(addr, dict):
+        # Irányítószám
+        irsz = addr.get("postCode") or g("postCode", "irsz")
+        if irsz:
+            cim_parts.append(str(irsz))
+        # Település
+        telep = addr.get("city") or telepules
+        if telep:
+            cim_parts.append(str(telep))
+        # Utca, házszám
+        utca = addr.get("street") or addr.get("addressLine") or g("street", "addressLine")
+        if utca:
+            cim_parts.append(str(utca))
+    if not cim_parts:
+        # Ha nem sikerült, próbáljuk a régi módszereket
+        cim = g("address", "cim", "fullAddress", "ingatlanCim")
+        if not cim and telepules:
+            cim = str(telepules)
+    else:
+        cim = ", ".join(cim_parts)
 
+    # Tulajdoni hányad
     hanyad = g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad")
-    # Beköltözhetőséget nem kell kiolvasnunk, de az üzenetbe berakhatjuk
-    bek_raw = g("isFree", "bekoltözheto", "moveln", "movable")
-    bekoltözhető = "igen" if str(bek_raw).lower() in ("true", "1", "igen", "yes") else "ismeretlen"
 
+    # Beköltözhető – a lista moveln=true miatt fixen igen
+    bekoltözhető = "igen"
+
+    # Árak
     kikialtas_ar = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
     minimum_ar   = parse_price(g("minPrice", "minimumAr", "minimumBid"))
     legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
     price = legmagasabb_licit or minimum_ar or kikialtas_ar
 
+    # Licitek száma
     licit_szam = g("bidCount", "licitekSzama")
     if licit_szam is not None:
         try:
             licit_szam = int(licit_szam)
         except:
             licit_szam = 0
+    else:
+        licit_szam = 0
 
-    telek_raw = g("area", "telekmeret", "builtArea", "alapterulet")
+    # Teleft (keresés bővítve)
+    telek_raw = g("area", "totalArea", "landArea", "builtArea", "alapterulet", "telekmeret")
     telek = parse_area(telek_raw)
 
+    # Árverés vége
     arveres_vege = g("endDate", "auctionEnd", "deadline", "befejezesDatuma")
+
+    # Ft/m²
     ft_per_m2 = int(price / telek) if price and telek and telek > 0 else None
 
     return {
         "megye": megye,
         "telepules": telepules,
-        "cim": cim or "N/A",
+        "cim": cim if cim else "N/A",
         "tulajdoni_hanyad": hanyad,
         "bekoltözhető": bekoltözhető,
         "price": price,
@@ -260,29 +290,73 @@ def send_telegram(data: Dict):
         log.warning("Telegram nincs beállítva")
         return
 
-    price_str = f"{data['price']:,} Ft".replace(",", " ") if data.get("price") else "N/A"
-    legh_str = f"{data['legmagasabb_licit']:,} Ft".replace(",", " ") if data.get("legmagasabb_licit") else "nincs"
-    telek_str = f"{data['telekmeret']:.0f} m2" if data.get("telekmeret") else "N/A"
-    ft_m2_str = f"{data['ft_per_m2']:,} Ft/m2".replace(",", " ") if data.get("ft_per_m2") else "N/A"
+    # Ár formázása
+    price = data.get("price")
+    price_str = f"{price:,} Ft".replace(",", " ") if price else None
 
-    text = (
-        "✅ ÚJ MBVK TALÁLAT\n\n"
-        f"Cím:\n{data.get('cim', 'N/A')}\n\n"
-        f"Ár:\n{price_str}\n\n"
-        f"Legmagasabb licit:\n{legh_str}\n\n"
-        f"Licitek száma:\n{data.get('licitek_szama', 0)}\n\n"
-        f"Telek:\n{telek_str}\n\n"
-        f"Ft/m²:\n{ft_m2_str}\n\n"
-        f"Beköltözhető:\n{data.get('bekoltözhető', 'N/A')}\n\n"
-        f"Tulajdoni hányad:\n{data.get('tulajdoni_hanyad', 'N/A')}\n\n"
-        f"Árverés vége:\n{data.get('arveres_vege', 'N/A')}\n\n"
-        f"Link:\n{data.get('url', '')}"
-    )
+    # Legmagasabb licit
+    legh = data.get("legmagasabb_licit")
+    legh_str = f"{legh:,} Ft".replace(",", " ") if legh else None
+
+    # Licitek száma (csak ha >0)
+    licit_szam = data.get("licitek_szama", 0)
+    licit_str = str(licit_szam) if licit_szam > 0 else None
+
+    # Teleft (csak ha van)
+    telek = data.get("telekmeret")
+    telek_str = f"{telek:.0f} m²" if telek else None
+
+    # Ft/m² (csak ha van)
+    ft_m2 = data.get("ft_per_m2")
+    ft_m2_str = f"{ft_m2:,} Ft/m²".replace(",", " ") if ft_m2 else None
+
+    # Beköltözhető (most már tuti igen)
+    bek_str = "igen"  # vagy data.get("bekoltözhető") ha átállítottad
+
+    # Tulajdoni hányad
+    hanyad = data.get("tulajdoni_hanyad")
+    hanyad_str = hanyad if hanyad else None
+
+    # Árverés vége (csak ha van)
+    end = data.get("arveres_vege")
+    end_str = end if end and end != "N/A" else None
+
+    # Összeállítjuk az üzenetet soronként, csak a nem None értékeket
+    lines = []
+    lines.append("🏠 *ÚJ MBVK TALÁLAT*")
+    lines.append("")
+    if data.get("cim") and data.get("cim") != "N/A":
+        lines.append(f"📍 *Cím:* {data['cim']}")
+    if price_str:
+        lines.append(f"💰 *Ár:* {price_str}")
+    if legh_str:
+        lines.append(f"📈 *Legmagasabb licit:* {legh_str}")
+    if licit_str:
+        lines.append(f"🔄 *Licitek száma:* {licit_str}")
+    if telek_str:
+        lines.append(f"📐 *Telek/alapterület:* {telek_str}")
+    if ft_m2_str:
+        lines.append(f"💹 *Ft/m²:* {ft_m2_str}")
+    if bek_str:
+        lines.append(f"🚪 *Beköltözhető:* {bek_str}")
+    if hanyad_str:
+        lines.append(f"📄 *Tulajdoni hányad:* {hanyad_str}")
+    if end_str:
+        lines.append(f"⏳ *Árverés vége:* {end_str}")
+    lines.append("")
+    lines.append(f"🔗 [Részletek]({data.get('url', '')})")
+
+    text = "\n".join(lines)
 
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": False
+            },
             timeout=15,
         )
         if resp.status_code == 200:
@@ -291,7 +365,6 @@ def send_telegram(data: Dict):
             log.error("Telegram hiba: %s %s", resp.status_code, resp.text[:300])
     except Exception as exc:
         log.error("Telegram küldési hiba: %s", exc)
-
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
