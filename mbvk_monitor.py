@@ -509,8 +509,7 @@ def send_telegram(data: Dict):
         lines.append(f"💰 *Ár:* {price_str}")
     if legh_str:
         lines.append(f"📈 *Legmagasabb licit:* {legh_str}")
-    if licit_str:
-        lines.append(f"🔄 *Licitek száma:* {licit_str}")
+
     if telek_str:
         lines.append(f"🏕 *Telekméret:* {telek_str}")
     if epulet_str:
@@ -520,6 +519,8 @@ def send_telegram(data: Dict):
     lines.append("🚪 *Beköltözhető:* igen")
     if hanyad_str:
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad_str}")
+    if licit_str:
+        lines.append(f"🔄 *Licitek száma:* {licit_str}")
     if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
 
