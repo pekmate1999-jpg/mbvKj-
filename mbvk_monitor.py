@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v3
-Lista: publicapi/auction/list
-Részlet: publicapi/auction/detail/{exec_id}/{auction_id}
+MBVK Árverési Monitor v3 (GitHub Action optimalizált)
 """
 
+import csv
 import os
 import re
 import sys
 import time
-import logging
 import sqlite3
+import logging
 import unicodedata
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict
 
 import requests
-#from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# ── Globális szótár ──────────────────────────────────────────────────────────
+TELEPULES_MAP = {}
+
+def load_telepules_map():
+    try:
+        with open("telepulesek.csv", mode='r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter=';')
+            for row in reader:
+                if len(row) >= 2:
+                    TELEPULES_MAP[normalize(row[0].strip())] = row[1].strip()
+        log.info("Település mappa betöltve: %d elem", len(TELEPULES_MAP))
+    except FileNotFoundError:
+        log.error("telepulesek.csv NEM TALÁLHATÓ! A megye kiegészítés nem fog működni.")
+    except Exception as e:
+        log.error("Hiba a CSV betöltésekor: %s", e)
 
 # ── Konfiguráció ──────────────────────────────────────────────────────────────
-
 BASE_URL      = "https://arveres.mbvk.hu"
 API_BASE      = "https://arveres.mbvk.hu/publicapi"
 DB_PATH       = "mbvk_v7.db"
@@ -40,8 +53,6 @@ COUNTIES = [
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -50,7 +61,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── SQLite ────────────────────────────────────────────────────────────────────
-
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -63,34 +73,26 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 def is_new(conn, auction_id: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM properties WHERE auction_id = ?", (auction_id,)
-    ).fetchone() is None
+    return conn.execute("SELECT 1 FROM properties WHERE auction_id = ?", (auction_id,)).fetchone() is None
 
 def mark_seen(conn, auction_id: str):
-    conn.execute(
-        "INSERT OR IGNORE INTO properties (auction_id, created) VALUES (?, ?)",
-        (auction_id, datetime.utcnow().isoformat()),
-    )
+    conn.execute("INSERT OR IGNORE INTO properties (auction_id, created) VALUES (?, ?)",
+                 (auction_id, datetime.utcnow().isoformat()))
     conn.commit()
 
 # ── Segédfüggvények ───────────────────────────────────────────────────────────
-
 def normalize(text: str) -> str:
     nfkd = unicodedata.normalize("NFKD", text.lower())
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 def parse_price(val) -> Optional[int]:
-    if val is None:
-        return None
+    if val is None: return None
     digits = re.sub(r"[^\d]", "", str(val))
     return int(digits) if digits else None
 
 def parse_area(val) -> Optional[float]:
-    if val is None:
-        return None
-    s = str(val).strip()
-    m = re.search(r"([\d]+(?:[.,][\d]+)?)", s)
+    if val is None: return None
+    m = re.search(r"([\d]+(?:[.,][\d]+)?)", str(val))
     if m:
         try:
             return float(m.group(1).replace(",", "."))
@@ -99,19 +101,14 @@ def parse_area(val) -> Optional[float]:
     return None
 
 # ── API hívások ───────────────────────────────────────────────────────────────
-
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
     "Accept": "application/json",
-    "Referer": "https://arveres.mbvk.hu/",
+    "Referer": BASE_URL,
 }
 
-def api_list(session: requests.Session, offset=0, limit=100) -> list[dict]:
-    """Lekéri az árverési listát az API-ból."""
-    url = (f"{API_BASE}/auction/list"
-           f"?offset={offset}&limit={limit}"
-           f"&sortMod=feltolt&sortDirection=desc"
-           f"&phaseCode=normal_ingatlan_2021&isLive=true") # <--- ITT FRISSÍTVE A KÓD
+def api_list(session: requests.Session, offset=0, limit=100) -> List[Dict]:
+    url = f"{API_BASE}/auction/list?offset={offset}&limit={limit}&sortMod=feltolt&sortDirection=desc&phaseCode=normal_ingatlan_2021&isLive=true"
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
@@ -122,97 +119,95 @@ def api_list(session: requests.Session, offset=0, limit=100) -> list[dict]:
         log.warning("Lista API hiba: %s", exc)
         return []
 
-
-def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[dict]:
-    """Lekéri egy árverés részleteit."""
+def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]:
     url = f"{API_BASE}/auction/detail/{exec_id}/{auction_id}"
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
-        body = r.json()
-        data = body.get("data", {})
-        log.info("Részlet API OK: %s/%s | kulcsok: %s",
-                 exec_id, auction_id, list(data.keys())[:20])
-        return data
+        return r.json().get("data", {})
     except Exception as exc:
         log.warning("Részlet API hiba (%s/%s): %s", exec_id, auction_id, exc)
         return None
 
-
-def extract(data: dict) -> dict:
-    """
-    Kinyeri a szükséges mezőket az API 'data' objektumából.
-    Módosítva: kezeli a propertyAttributes listát és a propertyAddress szótárat.
-    """
-    
-    def get_from_attrs(key_to_find):
-        """Keresés a propertyAttributes listában."""
+def extract(data: Dict) -> Dict:
+    def get_from_attrs(key):
         attrs = data.get("propertyAttributes", [])
         if isinstance(attrs, list):
             for attr in attrs:
-                if isinstance(attr, dict) and attr.get("key") == key_to_find:
+                if isinstance(attr, dict) and attr.get("key") == key:
                     return attr.get("value")
         return None
 
     def g(*keys):
         for k in keys:
-            # 1. Közvetlen keresés
-            if k in data: return data[k]
-            
-            # 2. propertyAttributes keresés
+            if k in data:
+                return data[k]
             val = get_from_attrs(k)
             if val is not None and str(val).strip() not in ("", "null", "None"):
                 return val
-            
-            # 3. propertyAddress keresés
             addr = data.get("propertyAddress", {})
             if isinstance(addr, dict) and k in addr:
                 return addr[k]
         return None
 
-    # Megye (próbáljuk a 'county'-t az attribútumokból vagy a címből)
     megye = g("county", "megye", "varmegye", "countyName")
-    
-    # Település
     telepules = g("city", "telepules", "cityName", "addressCity")
 
-    # Cím
+    if not megye and telepules:
+        norm_telepules = normalize(str(telepules))
+        if norm_telepules in TELEPULES_MAP:
+            megye = TELEPULES_MAP[norm_telepules]
+            log.debug("Megye kiegészítve: %s -> %s", telepules, megye)
+
     cim = g("address", "cim", "fullAddress", "ingatlanCim")
     if not cim and telepules:
         cim = str(telepules)
 
-    # Tulajdoni hányad
     hanyad = g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad")
 
-    # Beköltözhető (A log alapján ezeket a kulcsokat kell keresni)
     bek_raw = g("isFree", "bekoltözheto", "bekoltozheto", "movable", "isFreeToMove")
-    if str(bek_raw).lower() in ("true", "1", "igen", "yes"):
-        bekoltözhető = "igen"
-    else:
-        bekoltözhető = "nem"
+    bekoltözhető = "igen" if str(bek_raw).lower() in ("true", "1", "igen", "yes") else "nem"
 
-    # Árak
     kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
     minimum_ar        = parse_price(g("minPrice", "minimumAr", "minimumBid"))
     legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
-    
     price = legmagasabb_licit or minimum_ar or kikialtas_ar
 
+    licit_szam = g("bidCount", "licitekSzama")
+    try:
+        licit_szam = int(licit_szam) if licit_szam else 0
+    except:
+        licit_szam = 0
+
+    telek_raw = g("area", "telekmeret", "builtArea", "alapterulet")
+    telek = parse_area(telek_raw)
+
+    arveres_vege = g("endDate", "auctionEnd", "deadline", "befejezesDatuma")
+
+    ft_per_m2 = None
+    if price and telek and telek > 0:
+        ft_per_m2 = int(price / telek)
+
+    url = data.get("url", "")
+
     return {
-        "megye":            str(megye) if megye else None,
-        "telepules":        str(telepules) if telepules else None,
-        "cim":              str(cim) if cim else "N/A",
+        "megye": str(megye) if megye else None,
+        "telepules": str(telepules) if telepules else None,
+        "cim": str(cim) if cim else "N/A",
         "tulajdoni_hanyad": str(hanyad) if hanyad else None,
-        "bekoltözhető":     bekoltözhető,
-        "price":            price,
-        "url":              data.get("url", ""),
+        "bekoltözhető": bekoltözhető,
+        "price": price,
+        "legmagasabb_licit": legmagasabb_licit,
+        "licitek_szama": licit_szam,
+        "telekmeret": telek,
+        "ft_per_m2": ft_per_m2,
+        "arveres_vege": str(arveres_vege) if arveres_vege else "N/A",
+        "url": url,
     }
 
 # ── Szűrés ────────────────────────────────────────────────────────────────────
-
 def county_matches(megye: Optional[str]) -> bool:
-    if not megye:
-        return False
+    if not megye: return False
     norm = normalize(megye)
     for c in COUNTIES:
         if normalize(c) in norm or norm in normalize(c):
@@ -220,59 +215,47 @@ def county_matches(megye: Optional[str]) -> bool:
     return False
 
 def share_accepted(hanyad: Optional[str]) -> bool:
-    if not hanyad:
-        return False
+    if not hanyad: return False
     h = hanyad.strip()
-    if re.fullmatch(r"1/1", h):
-        return True
+    if re.fullmatch(r"1/1", h): return True
     parts = re.split(r"\s*[+&]\s*", h)
-    if len(parts) == 2 and all(re.fullmatch(r"1/2", p.strip()) for p in parts):
-        return True
+    if len(parts) == 2 and all(re.fullmatch(r"1/2", p.strip()) for p in parts): return True
     return False
 
-def passes_filters(data: dict) -> bool:
+def passes_filters(data: Dict) -> bool:
     if not county_matches(data.get("megye")):
-        log.info("Szűrve (megye): %s", data.get("megye"))
         return False
     if data.get("bekoltözhető") != "igen":
-        log.info("Szűrve (beköltözhető): %s", data.get("bekoltözhető"))
         return False
     if not share_accepted(data.get("tulajdoni_hanyad")):
-        log.info("Szűrve (hányad): %s", data.get("tulajdoni_hanyad"))
         return False
     price = data.get("price")
     if price is None or price > MAX_PRICE:
-        log.info("Szűrve (ár): %s", price)
         return False
     return True
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-
-def send_telegram(data: dict):
+def send_telegram(data: Dict):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram nincs beállítva")
+        log.error("Telegram nincs beállítva, nem küldök üzenetet.")
         return
 
-    price = data.get("price")
-    price_str = f"{price:,} Ft".replace(",", " ") if price else "N/A"
-    legh  = data.get("legmagasabb_licit")
-    legh_str = f"{legh:,} Ft".replace(",", " ") if legh else "nincs"
-    telek = data.get("telekmeret")
-    telek_str = f"{telek:.0f} m2" if telek else "N/A"
-    ft_m2 = data.get("ft_per_m2")
-    ft_m2_str = f"{ft_m2:,} Ft/m2".replace(",", " ") if ft_m2 else "N/A"
+    price_str = f"{data['price']:,} Ft".replace(",", " ") if data.get("price") else "N/A"
+    legh_str = f"{data['legmagasabb_licit']:,} Ft".replace(",", " ") if data.get("legmagasabb_licit") else "nincs"
+    telek_str = f"{data['telekmeret']:.0f} m2" if data.get("telekmeret") else "N/A"
+    ft_m2_str = f"{data['ft_per_m2']:,} Ft/m2".replace(",", " ") if data.get("ft_per_m2") else "N/A"
 
     text = (
-        "uj MBVK TALALAT\n\n"
-        f"Cim:\n{data.get('cim', 'N/A')}\n\n"
-        f"Ar:\n{price_str}\n\n"
+        "✅ ÚJ MBVK TALÁLAT\n\n"
+        f"Cím:\n{data.get('cim', 'N/A')}\n\n"
+        f"Ár:\n{price_str}\n\n"
         f"Legmagasabb licit:\n{legh_str}\n\n"
-        f"Licitek szama:\n{data.get('licitek_szama', 0)}\n\n"
+        f"Licitek száma:\n{data.get('licitek_szama', 0)}\n\n"
         f"Telek:\n{telek_str}\n\n"
-        f"Ft/m2:\n{ft_m2_str}\n\n"
-        f"Bekoltozheto:\nigen\n\n"
-        f"Tulajdon:\n{data.get('tulajdoni_hanyad', 'N/A')}\n\n"
-        f"Arveres vege:\n{data.get('arveres_vege', 'N/A')}\n\n"
+        f"Ft/m²:\n{ft_m2_str}\n\n"
+        f"Beköltözhető:\n{data.get('bekoltözhető', 'N/A')}\n\n"
+        f"Tulajdoni hányad:\n{data.get('tulajdoni_hanyad', 'N/A')}\n\n"
+        f"Árverés vége:\n{data.get('arveres_vege', 'N/A')}\n\n"
         f"Link:\n{data.get('url', '')}"
     )
 
@@ -285,20 +268,39 @@ def send_telegram(data: dict):
         if resp.status_code == 200:
             log.info("Telegram elküldve: %s", data.get("auction_id"))
         else:
-            log.error("Telegram hiba: %s %s", resp.status_code, resp.text[:300])
+            log.error("Telegram hiba: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        log.error("Telegram kuldesi hiba: %s", exc)
+        log.error("Telegram küldési hiba: %s", exc)
+
+def send_debug_message(msg: str):
+    """Hiba esetén értesítés küldése."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"⚠️ MBVK Monitor figyelmeztetés:\n{msg}"},
+            timeout=15,
+        )
+    except:
+        pass
 
 # ── Főprogram ─────────────────────────────────────────────────────────────────
-
 def run():
-    log.info("MBVK Monitor inditas – %s", datetime.now().isoformat())
+    load_telepules_map()
+
+    # Ellenőrizzük a Telegram beállításokat
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_TOKEN vagy TELEGRAM_CHAT_ID nincs beállítva!")
+        return
+
+    log.info("MBVK Monitor indítás – %s", datetime.now().isoformat())
     conn = init_db()
 
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # ── 1. Lista lekérése API-ból ──
+    # Lista lekérés
     items = []
     offset = 0
     while True:
@@ -314,63 +316,54 @@ def run():
     log.info("Összesen %d árverés a listában", len(items))
 
     if not items:
-        log.warning("Üres lista – kilépés")
+        log.warning("Üres lista – nincs árverés.")
+        send_debug_message("Az API üres listát adott vissza. Lehet, hogy változott a paraméter vagy nincs élő árverés.")
         conn.close()
         return
 
-    new_count = notified_count = 0
+    new_count = 0
+    notified_count = 0
+    total_checked = 0
 
     for item in items:
-      # Az exec_id és auction_id kinyerése a lista elemből
-        exec_id    = str(item.get("auctionId") or "")
+        exec_id = str(item.get("auctionId") or "")
         auction_id = str(item.get("id") or "")
-
-        log.info("Lista elem kulcsok: %s", list(item.keys()))
-
         if not auction_id:
-            log.warning("Nincs auction_id: %s", item)
             continue
 
-        auction_id = str(auction_id)
-        exec_id    = str(exec_id)
-
-        url = f"{BASE_URL}/arveres-reszletek/{exec_id}/{auction_id}"
+        total_checked += 1
 
         if not is_new(conn, auction_id):
-            log.debug("Már ismert: %s", auction_id)
             continue
 
         new_count += 1
-
-        # ── 2. Részlet API ──
         detail = api_detail(session, exec_id, auction_id)
         if not detail:
-            log.warning("Nincs részlet: %s/%s", exec_id, auction_id)
             mark_seen(conn, auction_id)
             continue
 
         data = extract(detail)
         data["auction_id"] = auction_id
-        data["url"]        = url
+        data["url"] = f"{BASE_URL}/arveres-reszletek/{exec_id}/{auction_id}"
 
-        log.info(
-            "Feldolgozva: %s | megye=%s | hányad=%s | bekolt=%s | ár=%s",
-            auction_id, data.get("megye"), data.get("tulajdoni_hanyad"),
-            data.get("bekoltözhető"), data.get("price"),
-        )
+        log.info("Feldolgozva: %s | megye=%s | hányad=%s | bekölt=%s | ár=%s",
+                 auction_id, data["megye"], data["tulajdoni_hanyad"], data["bekoltözhető"], data["price"])
 
         if passes_filters(data):
-            log.info("SZÜRÖÖN ÁTMENT: %s", auction_id)
+            log.info("✅ SZŰRŐN ÁTMENT: %s", auction_id)
             send_telegram(data)
             notified_count += 1
 
         mark_seen(conn, auction_id)
         time.sleep(0.5)
 
-    log.info("Kész – Új: %d / Értesítés: %d / Összes: %d",
-             new_count, notified_count, len(items))
+    log.info("Kész – Összes ellenőrzött: %d, Új: %d, Értesítés: %d", total_checked, new_count, notified_count)
     conn.close()
 
-
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except Exception as e:
+        log.critical("Végzetes hiba: %s", e, exc_info=True)
+        send_debug_message(f"A script összeomlott: {str(e)}")
+        sys.exit(1)
