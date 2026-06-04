@@ -2,8 +2,9 @@ name: MBVK Monitor
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # 30 percenként
-  workflow_dispatch:         # kézi indítás is
+    
+    - cron: '0 6,18 * * *'   
+  workflow_dispatch:
 
 jobs:
   check:
