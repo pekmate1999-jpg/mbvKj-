@@ -4,7 +4,27 @@ MBVK Árverési Monitor v3
 Lista: publicapi/auction/list
 Részlet: publicapi/auction/detail/{exec_id}/{auction_id}
 """
+import csv
 
+# Globális szótár a település-megye pároknak
+TELEPULES_MAP = {}
+
+def load_telepules_map():
+    """Beolvassa a CSV-t egy szótárba."""
+    try:
+        with open("telepulesek.csv", mode='r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter=';') # Ha pontosvesszős a CSV
+            for row in reader:
+                if len(row) >= 2:
+                    # Feltételezzük: 0. oszlop = település, 1. oszlop = megye
+                    telepules_nev = row[0].strip()
+                    megye_nev = row[1].strip()
+                    TELEPULES_MAP[normalize(telepules_nev)] = megye_nev
+        log.info("Település mappa betöltve: %d elem", len(TELEPULES_MAP))
+    except Exception as e:
+        log.error("Hiba a CSV betöltésekor: %s", e)
+
+# Hívd meg ezt a függvényt a run() elején!
 import os
 import re
 import sys
@@ -171,7 +191,16 @@ def extract(data: dict) -> dict:
         return None
 
     # Megye (próbáljuk a 'county'-t az attribútumokból vagy a címből)
+    # Megye keresése API-ból
     megye = g("county", "megye", "varmegye", "countyName")
+    telepules = g("city", "telepules", "cityName", "addressCity")
+
+    # HA NINCS MEGYE, de van település -> keressük ki a szótárból
+    if not megye and telepules:
+        norm_telepules = normalize(str(telepules))
+        if norm_telepules in TELEPULES_MAP:
+            megye = TELEPULES_MAP[norm_telepules]
+            log.info("Megye kiegészítve szótárból: %s -> %s", telepules, megye)
     
     # Település
     telepules = g("city", "telepules", "cityName", "addressCity")
@@ -292,8 +321,11 @@ def send_telegram(data: dict):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 
 def run():
+   def run():
+    load_telepules_map() # Itt töltjük be a 3000 sort egyszer
     log.info("MBVK Monitor inditas – %s", datetime.now().isoformat())
     conn = init_db()
+    # ... a többi kód ...
 
     session = requests.Session()
     session.headers.update(HEADERS)
