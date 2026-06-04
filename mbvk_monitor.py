@@ -532,7 +532,7 @@ def send_telegram(data: Dict):
     lines.append("🚪 *Beköltözhető:* igen")
     if hanyad_str:
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad_str}")
-        if end_str:
+    if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
 
     lines.append(f"📊 *Státusz:* {timeline}")   # ugyanannyi szóközzel, mint a felette lévő sorok
