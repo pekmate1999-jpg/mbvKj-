@@ -111,7 +111,7 @@ def api_list(session: requests.Session, offset=0, limit=100) -> list[dict]:
     url = (f"{API_BASE}/auction/list"
            f"?offset={offset}&limit={limit}"
            f"&sortMod=feltolt&sortDirection=desc"
-           f"&phaseCode=online_ingo_2021&isLive=true")
+           f"&phaseCode=ingatlan&isLive=true")
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
