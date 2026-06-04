@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor – GitHub Actions verzió Playwright-tal
+MBVK Árverési Monitor – GitHub Actions Playwright-tal
 """
 import re
 import os
@@ -15,18 +15,16 @@ from typing import Optional, List, Dict
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-# ── Konfiguráció ──────────────────────────────────────────────────────────────
 BASE_URL = "https://arveres.mbvk.hu"
 DB_PATH = "mbvk.db"
-MAX_PRICE = 1_000_000          # Ft
-COUNTIES = []                  # pl. ["Békés"]
+MAX_PRICE = 1_000_000
+COUNTIES = []  # pl. ["Békés"]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── SQLite ────────────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS properties (auction_id TEXT PRIMARY KEY, created TEXT)")
@@ -41,7 +39,12 @@ def mark_seen(conn, auction_id):
                  (auction_id, datetime.utcnow().isoformat()))
     conn.commit()
 
-# ── Adatok kinyerése a renderelt HTML-ből ─────────────────────────────────────
+def parse_price(val: str) -> Optional[int]:
+    if not val:
+        return None
+    digits = re.sub(r"[^\d]", "", str(val))
+    return int(digits) if digits else None
+
 def extract_from_rendered_html(html: str, url: str) -> Dict:
     soup = BeautifulSoup(html, 'html.parser')
     # Cím
@@ -82,7 +85,11 @@ def extract_from_rendered_html(html: str, url: str) -> Dict:
             images.append(src)
     # Ügyszám
     case_elem = soup.select_one("h1")
-    case_number = re.search(r"Ügyszám:\s*([^\<]+)", case_elem.get_text()).group(1).strip() if case_elem else ""
+    case_number = ""
+    if case_elem:
+        m = re.search(r"Ügyszám:\s*([^\<]+)", case_elem.get_text())
+        if m:
+            case_number = m.group(1).strip()
     # Település
     telepules = ""
     if cim != "N/A":
@@ -106,13 +113,6 @@ def extract_from_rendered_html(html: str, url: str) -> Dict:
         "images": images,
     }
 
-def parse_price(val: str) -> Optional[int]:
-    if not val:
-        return None
-    digits = re.sub(r"[^\d]", "", str(val))
-    return int(digits) if digits else None
-
-# ── Szűrés ───────────────────────────────────────────────────────────────────
 def share_accepted(hanyad: Optional[str]) -> bool:
     if not hanyad:
         return False
@@ -126,7 +126,6 @@ def share_accepted(hanyad: Optional[str]) -> bool:
 
 def passes_filters(data: Dict) -> bool:
     if COUNTIES:
-        # itt ki lehet egészíteni megye ellenőrzéssel (ha a címből kinyerhető)
         pass
     if data.get("end_date"):
         try:
@@ -142,20 +141,9 @@ def passes_filters(data: Dict) -> bool:
         return False
     return True
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-def send_telegram_photo(photo_url: str, caption: str):
+def send_telegram(data: Dict):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    try:
-        import requests
-        img_data = requests.get(photo_url, timeout=10).content
-        files = {'photo': img_data}
-        data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files)
-    except Exception as e:
-        log.error("Kép küldés hiba: %s", e)
-
-def send_telegram(data: Dict):
     import requests
     lines = ["🏠 *ÚJ MBVK ÁRVERÉS*", ""]
     if data.get("cim"):
@@ -190,12 +178,16 @@ def send_telegram(data: Dict):
                       json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
     except Exception as e:
         log.error("Telegram hiba: %s", e)
-    for i, img in enumerate(data.get("images", [])[:3]):
-        send_telegram_photo(img, f"Kép {i+1}")
+    for img in data.get("images", [])[:3]:
+        try:
+            img_data = requests.get(img, timeout=10).content
+            files = {'photo': img_data}
+            data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': "📸"}
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files)
+        except Exception as e:
+            log.error("Kép küldés hiba: %s", e)
 
-# ── Összes árverés linkjének begyűjtése a böngészővel ────────────────────────
 def get_all_auction_links(page):
-    """Végigmegy a lapozón, és összegyűjti az összes árverés linkjét."""
     links = set()
     page.goto(f"{BASE_URL}/arveresi-hirdetmenyek?moveln=true&phaseCode=normal_ingatlan_2021")
     page.wait_for_selector("div.auction-item, .auction-list-item", timeout=10000)
@@ -207,7 +199,6 @@ def get_all_auction_links(page):
             if href:
                 full_url = href if href.startswith("http") else BASE_URL + href
                 links.add(full_url)
-        # Megkeressük a következő oldal gombot
         next_btn = page.query_selector("a.next:visible, a[rel='next']:visible, button:has-text('Következő'):visible")
         if not next_btn or next_btn.get_attribute("disabled") is not None:
             break
@@ -227,9 +218,9 @@ def run():
             "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.8",
         })
         urls = get_all_auction_links(page)
-        log.info("Összesen %d árverési link található", len(urls))
+        log.info("Összesen %d árverési link", len(urls))
         new_count = notified_count = 0
-        for url in urls[:100]:  # teszteléshez max 100
+        for url in urls[:100]:
             match = re.search(r"/(\d+)$", url)
             auction_id = match.group(1) if match else None
             if not auction_id or not is_new(conn, auction_id):
@@ -242,15 +233,15 @@ def run():
                 html = page.content()
                 data = extract_from_rendered_html(html, url)
                 if passes_filters(data):
-                    log.info("✅ Értesítés küldése: %s", auction_id)
+                    log.info("✅ Értesítés: %s", auction_id)
                     send_telegram(data)
                     notified_count += 1
                 else:
-                    log.info("❌ Nem felel meg a szűrőknek: %s", auction_id)
+                    log.info("❌ Szűrőn kiesett: %s", auction_id)
                 mark_seen(conn, auction_id)
                 time.sleep(2)
             except Exception as e:
-                log.error("Hiba a %s feldolgozásakor: %s", url, e)
+                log.error("Hiba %s: %s", url, e)
                 mark_seen(conn, auction_id)
         browser.close()
     log.info("Kész. Új: %d, értesített: %d", new_count, notified_count)
