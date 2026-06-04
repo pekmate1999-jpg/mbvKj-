@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v3 - Beköltözhető ingatlanokra szűrve (moveln=true)
+MBVK Árverési Monitor v3 – Beköltözhető ingatlanok (moveln=true)
+Szűrés: tulajdoni hányad (1/1 vagy 1/2+1/2) és max ár 1M Ft
 """
 
 import csv
@@ -16,7 +17,7 @@ from typing import Optional, List, Dict
 
 import requests
 
-# ── Globális szótár (megye kiegészítéshez, de nem kötelező) ──
+# ── Település-megye szótár (opcionális) ──────────────────────────────────────
 TELEPULES_MAP = {}
 
 def load_telepules_map():
@@ -28,7 +29,7 @@ def load_telepules_map():
                     TELEPULES_MAP[normalize(row[0].strip())] = row[1].strip()
         log.info("Település mappa betöltve: %d elem", len(TELEPULES_MAP))
     except FileNotFoundError:
-        log.warning("telepulesek.csv nem található")
+        log.warning("telepulesek.csv nem található – megye kiegészítés nem működik")
     except Exception as e:
         log.error("Hiba a CSV betöltésekor: %s", e)
 
@@ -38,7 +39,7 @@ API_BASE      = "https://arveres.mbvk.hu/publicapi"
 DB_PATH       = "mbvk_v7.db"
 MAX_PRICE     = 1_000_000
 
-# Megye szűrés KI (üres lista)
+# Megye szűrés KI (üres lista = minden megye jó)
 COUNTIES = []
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -112,7 +113,7 @@ def api_list(session: requests.Session, offset=0, limit=100) -> List[Dict]:
            f"?offset={offset}&limit={limit}"
            f"&sortMod=feltolt&sortDirection=desc"
            f"&phaseCode=normal_ingatlan_2021&isLive=true"
-           f"&moveln=true")   # ← BEKÖLTÖZHETŐ SZŰRŐ
+           f"&moveln=true")   # <- biztosítja, hogy csak beköltözhetők legyenek
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
@@ -135,7 +136,7 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
         return None
 
 def extract(data: Dict) -> Dict:
-    """Kinyeri a szükséges mezőket (beköltözhetőt már nem kell ellenőrizni, de azért kitölti)."""
+    """Kinyeri a szükséges mezőket (beköltözhetőséget nem kell ellenőrizni a szűrésben)."""
     def get_from_attrs(key):
         attrs = data.get("propertyAttributes", [])
         for attr in attrs:
@@ -160,12 +161,14 @@ def extract(data: Dict) -> Dict:
     if not megye and telepules and normalize(str(telepules)) in TELEPULES_MAP:
         megye = TELEPULES_MAP[normalize(str(telepules))]
 
-    cim = g("address", "cim", "fullAddress", "ingatlanCim") or str(telepules) if telepules else "N/A"
-    hanyad = g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad")
+    cim = g("address", "cim", "fullAddress", "ingatlanCim")
+    if not cim and telepules:
+        cim = str(telepules)
 
-    # Beköltözhető – mivel a lista már szűrt, alapból "igen", de az adatból is kiolvassuk
+    hanyad = g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad")
+    # Beköltözhetőséget nem kell kiolvasnunk, de az üzenetbe berakhatjuk
     bek_raw = g("isFree", "bekoltözheto", "moveln", "movable")
-    bekoltözhető = "igen" if str(bek_raw).lower() in ("true", "1", "igen", "yes") else "nem"
+    bekoltözhető = "igen" if str(bek_raw).lower() in ("true", "1", "igen", "yes") else "ismeretlen"
 
     kikialtas_ar = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
     minimum_ar   = parse_price(g("minPrice", "minimumAr", "minimumBid"))
@@ -188,7 +191,7 @@ def extract(data: Dict) -> Dict:
     return {
         "megye": megye,
         "telepules": telepules,
-        "cim": cim,
+        "cim": cim or "N/A",
         "tulajdoni_hanyad": hanyad,
         "bekoltözhető": bekoltözhető,
         "price": price,
@@ -200,9 +203,9 @@ def extract(data: Dict) -> Dict:
         "url": data.get("url", ""),
     }
 
-# ── Szűrés (megye nélkül, de beköltözhetőség és ár és hányad) ─────────────────
+# ── Szűrés (csak hányad és ár, mert a lista már beköltözhető) ─────────────────
 def county_matches(megye: Optional[str]) -> bool:
-    if not COUNTIES:   # üres lista => minden megye jó
+    if not COUNTIES:
         return True
     if not megye:
         return False
@@ -213,6 +216,7 @@ def share_accepted(hanyad: Optional[str]) -> bool:
     if not hanyad:
         return False
     h = hanyad.strip()
+    # 1/1 vagy 1/2 + 1/2 (illetve 1/2+1/2)
     if re.fullmatch(r"1/1", h):
         return True
     parts = re.split(r"\s*[+&]\s*", h)
@@ -221,17 +225,33 @@ def share_accepted(hanyad: Optional[str]) -> bool:
     return False
 
 def passes_filters(data: Dict) -> bool:
+    # Megye (opcionális)
     if not county_matches(data.get("megye")):
         return False
-    # Mivel a lista API már beköltözhetőket ad, itt is ellenőrizzük, de nem lesz gond
-    if data.get("bekoltözhető") != "igen":
-        log.debug("Nem beköltözhető: %s", data.get("bekoltözhető"))
-        return False
+
+    # Futó árverés ellenőrzése
+    end_date_str = data.get("arveres_vege")
+    if end_date_str and end_date_str != "N/A":
+        try:
+            end_date = datetime.fromisoformat(end_date_str.replace(' ', 'T'))
+        except:
+            try:
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+            except:
+                end_date = None
+        if end_date and end_date < datetime.now():
+            log.debug("Lejárt árverés: %s", end_date_str)
+            return False
+
+    # Tulajdoni hányad
     if not share_accepted(data.get("tulajdoni_hanyad")):
         return False
+
+    # Ár
     price = data.get("price")
     if price is None or price > MAX_PRICE:
         return False
+
     return True
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -275,7 +295,7 @@ def send_telegram(data: Dict):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor indítás (moveln=true) – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor indítás (moveln=true, bekölt. ellenőrzés NINCS) – %s", datetime.now().isoformat())
     conn = init_db()
 
     session = requests.Session()
@@ -309,6 +329,7 @@ def run():
 
         url = f"{BASE_URL}/arveres-reszletek/{exec_id}/{auction_id}"
         if not is_new(conn, auction_id):
+            log.debug("Már ismert: %s", auction_id)
             continue
 
         new_count += 1
