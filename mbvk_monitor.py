@@ -261,7 +261,6 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
 def generate_timeline(kezdete: str, vege: str, kiki_ar: Optional[int], min_ar: Optional[int]) -> str:
     import datetime
     
-    # 1. Időalapú haladás kiszámítása
     try:
         s_str = kezdete.split("T")[0].split()[0].replace(".", "-").strip("-")
         e_str = vege.split("T")[0].split()[0].replace(".", "-").strip("-")
@@ -270,45 +269,34 @@ def generate_timeline(kezdete: str, vege: str, kiki_ar: Optional[int], min_ar: O
         now_dt = datetime.datetime.now()
     except Exception:
         return "`[░░░░░|░░░░░|░░░░░]`\n_Ismeretlen időszak_"
-
+    
     total_sec = (end_dt - start_dt).total_seconds()
     if total_sec <= 0:
         return "`[█████|█████|█████]`\n_Lezárult_"
-
+    
     elapsed = (now_dt - start_dt).total_seconds()
     progress = max(0.0, min(1.0, elapsed / total_sec))
     
     # Vizuális sáv generálása
     filled = int(progress * 15)
     blocks = ["█" if i < filled else "░" for i in range(15)]
-    stage1, stage2, stage3 = "".join(blocks[0:5]), "".join(blocks[5:10]), "".join(blocks[10:15])
+    stage1 = "".join(blocks[0:5])
+    stage2 = "".join(blocks[5:10])
+    stage3 = "".join(blocks[10:15])
     
-    # 2. Szakasz intelligens becslése
+    # Szakasz meghatározása KIZÁRÓLAG idő alapján
     if progress < 0.333:
-        time_stage = 1
+        final_stage = 1
     elif progress < 0.666:
-        time_stage = 2
+        final_stage = 2
     else:
-        time_stage = 3
-        
-    price_stage = time_stage
-    ratio_text = ""
+        final_stage = 3
     
-    # Ár-arány vizsgálata (ha van minimum és kikiáltási ár is)
+    # Ár-arány csak megjelenítési info, NEM befolyásolja a szakaszt
+    ratio_text = ""
     if kiki_ar and min_ar and kiki_ar > 0:
         ratio = min_ar / kiki_ar
         ratio_text = f" ({int(ratio * 100)}%)"
-        
-        # Ha az arány alapján egyértelműen másik szakaszban van
-        if ratio >= 0.95:
-            price_stage = 1
-        elif ratio >= 0.75:
-            price_stage = 2
-        elif ratio < 0.75:
-            price_stage = 3
-            
-    # A legelőrehaladottabb állapotot vesszük figyelembe
-    final_stage = max(time_stage, price_stage)
     
     pct = int(progress * 100)
     bar = f"`[{stage1}|{stage2}|{stage3}]` {pct}%"
