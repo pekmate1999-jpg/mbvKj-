@@ -349,7 +349,7 @@ def run():
         time.sleep(0.5)
 
     conn.close()
-        return
+    
 
     new_count = notified_count = 0
 
