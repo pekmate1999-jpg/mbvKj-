@@ -224,7 +224,6 @@ def extract(data: dict) -> dict:
     kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
     minimum_ar        = parse_price(g("minPrice", "minimumAr", "minimumBid"))
     legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
-    
     price = legmagasabb_licit or minimum_ar or kikialtas_ar
 
     return {
@@ -321,29 +320,28 @@ def send_telegram(data: dict):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 
 def run():
-   def run():
-    load_telepules_map() # Itt töltjük be a 3000 sort egyszer
+    # 1. Település mappa betöltése (fontos: legyen telepulesek.csv a mappában!)
+    load_telepules_map() 
+    
     log.info("MBVK Monitor inditas – %s", datetime.now().isoformat())
     conn = init_db()
-    # ... a többi kód ...
-
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # ── 1. Lista lekérése API-ból ──
+    # 2. Lista lekérése
     items = []
     offset = 0
     while True:
         batch = api_list(session, offset=offset, limit=100)
-        if not batch:
-            break
+        if not batch: break
         items.extend(batch)
-        if len(batch) < 100:
-            break
+        if len(batch) < 100: break
         offset += 100
         time.sleep(0.5)
 
     log.info("Összesen %d árverés a listában", len(items))
+    
+    # ... (A többi rész maradjon az eredeti `run`-ból, csak ne legyen benne dupla def)
 
     if not items:
         log.warning("Üres lista – kilépés")
