@@ -160,80 +160,53 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[dict]
 
 
 def extract(data: dict) -> dict:
-    """
-    Kinyeri a szükséges mezőket az API 'data' objektumából.
-    Módosítva: kezeli a propertyAttributes listát és a propertyAddress szótárat.
-    """
-    
+    # A propertyAttributes lista tartalmának kiírása debughoz
+    attrs = data.get("propertyAttributes", [])
+    if isinstance(attrs, list):
+        log.info("Debug: Talált attribútumok: %s", [a.get("key") for a in attrs if isinstance(a, dict)])
+
     def get_from_attrs(key_to_find):
-        """Keresés a propertyAttributes listában."""
-        attrs = data.get("propertyAttributes", [])
         if isinstance(attrs, list):
             for attr in attrs:
-                if isinstance(attr, dict) and attr.get("key") == key_to_find:
+                if isinstance(attr, dict) and str(attr.get("key")).lower() == str(key_to_find).lower():
                     return attr.get("value")
         return None
 
     def g(*keys):
         for k in keys:
-            # 1. Közvetlen keresés
-            if k in data: return data[k]
-            
-            # 2. propertyAttributes keresés
-            val = get_from_attrs(k)
-            if val is not None and str(val).strip() not in ("", "null", "None"):
-                return val
-            
-            # 3. propertyAddress keresés
+            # 1. Közvetlen
+            if data.get(k): return data[k]
+            # 2. propertyAddress
             addr = data.get("propertyAddress", {})
-            if isinstance(addr, dict) and k in addr:
-                return addr[k]
+            if isinstance(addr, dict) and addr.get(k): return addr.get(k)
+            # 3. Attribútumok
+            val = get_from_attrs(k)
+            if val: return val
         return None
 
-    # Megye (próbáljuk a 'county'-t az attribútumokból vagy a címből)
-    # Megye keresése API-ból
-    megye = g("county", "megye", "varmegye", "countyName")
-    telepules = g("city", "telepules", "cityName", "addressCity")
+    # Megye keresése (bővített kulcslistával)
+    megye = g("county", "megye", "varmegye", "countyName", "megye_nev")
+    telepules = g("city", "telepules", "cityName", "addressCity", "varos")
 
-    # HA NINCS MEGYE, de van település -> keressük ki a szótárból
+    # CSV alapú megye kiegészítés
     if not megye and telepules:
-        norm_telepules = normalize(str(telepules))
-        if norm_telepules in TELEPULES_MAP:
-            megye = TELEPULES_MAP[norm_telepules]
-            log.info("Megye kiegészítve szótárból: %s -> %s", telepules, megye)
-    
-    # Település
-    telepules = g("city", "telepules", "cityName", "addressCity")
+        norm_t = normalize(str(telepules))
+        if norm_t in TELEPULES_MAP:
+            megye = TELEPULES_MAP[norm_t]
+            log.info("Megye kiegészítve CSV-ből: %s -> %s", telepules, megye)
 
-    # Cím
-    cim = g("address", "cim", "fullAddress", "ingatlanCim")
-    if not cim and telepules:
-        cim = str(telepules)
-
-    # Tulajdoni hányad
-    hanyad = g("p_tulajdonihanyad", "ownershipShare", "tulajdoniHanyad", "hanyad")
-
-    # Beköltözhető (A log alapján ezeket a kulcsokat kell keresni)
-    bek_raw = g("isFree", "bekoltözheto", "bekoltozheto", "movable", "isFreeToMove")
-    if str(bek_raw).lower() in ("true", "1", "igen", "yes"):
-        bekoltözhető = "igen"
-    else:
-        bekoltözhető = "nem"
-
-    # Árak
-    kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
-    minimum_ar        = parse_price(g("minPrice", "minimumAr", "minimumBid"))
-    legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
-    price = legmagasabb_licit or minimum_ar or kikialtas_ar
+    # Beköltözhető (több lehetséges kulcsnév)
+    bek_raw = g("isFree", "bekoltözheto", "bekoltozheto", "movable", "isFreeToMove", "szabad")
+    bekoltözhető = "igen" if str(bek_raw).lower() in ("true", "1", "igen", "yes") else "nem"
 
     return {
-        "megye":            str(megye) if megye else None,
-        "telepules":        str(telepules) if telepules else None,
-        "cim":              str(cim) if cim else "N/A",
-        "tulajdoni_hanyad": str(hanyad) if hanyad else None,
-        "bekoltözhető":     bekoltözhető,
-        "price":            price,
-        "url":              data.get("url", ""),
+        "megye": str(megye) if megye else None,
+        "telepules": str(telepules) if telepules else None,
+        "cim": str(g("address", "fullAddress", "cim")) or "N/A",
+        "tulajdoni_hanyad": str(g("ownershipShare", "tulajdoniHanyad")) if g("ownershipShare", "tulajdoniHanyad") else None,
+        "bekoltözhető": bekoltözhető,
+        "price": parse_price(g("putUpPrice", "startPrice", "currentBid")),
+        "url": data.get("url", ""),
     }
 
 # ── Szűrés ────────────────────────────────────────────────────────────────────
