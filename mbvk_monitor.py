@@ -311,7 +311,7 @@ def send_telegram(data: Dict):
     ft_m2_str = f"{ft_m2:,} Ft/m²".replace(",", " ") if ft_m2 else None
 
     # Beköltözhető (most már tuti igen)
-    bek_str = "igen"  # vagy data.get("bekoltözhető") ha átállítottad
+    bek_str = "igen"
 
     # Tulajdoni hányad
     hanyad = data.get("tulajdoni_hanyad")
@@ -321,12 +321,21 @@ def send_telegram(data: Dict):
     end = data.get("arveres_vege")
     end_str = end if end and end != "N/A" else None
 
+    # Google Maps link készítése
+    cim = data.get('cim', '')
+    maps_link = ""
+    if cim and cim != "N/A":
+        import urllib.parse
+        encoded_cim = urllib.parse.quote(cim)
+        maps_link = f"https://www.google.com/maps/search/?api=1&query={encoded_cim}"
+        maps_link = f"\n🗺️ [Térkép]({maps_link})"
+
     # Összeállítjuk az üzenetet soronként, csak a nem None értékeket
     lines = []
     lines.append("🏠 *ÚJ MBVK TALÁLAT*")
     lines.append("")
-    if data.get("cim") and data.get("cim") != "N/A":
-        lines.append(f"📍 *Cím:* {data['cim']}")
+    if cim and cim != "N/A":
+        lines.append(f"📍 *Cím:* {cim}")
     if price_str:
         lines.append(f"💰 *Ár:* {price_str}")
     if legh_str:
@@ -344,7 +353,7 @@ def send_telegram(data: Dict):
     if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
     lines.append("")
-    lines.append(f"🔗 [Részletek]({data.get('url', '')})")
+    lines.append(f"🔗 [Részletek]({data.get('url', '')}){maps_link}")
 
     text = "\n".join(lines)
 
@@ -364,7 +373,7 @@ def send_telegram(data: Dict):
         else:
             log.error("Telegram hiba: %s %s", resp.status_code, resp.text[:300])
     except Exception as exc:
-        log.error("Telegram küldési hiba: %s", exc)
+        log.error("Telegram küldési hiba: %s", exc))
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
