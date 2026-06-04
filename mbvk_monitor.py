@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor – Playwright + BeautifulSoup
+MBVK Árverési Monitor – GitHub Actions verzió Playwright-tal
 """
-
 import re
 import os
 import sys
@@ -18,10 +17,9 @@ from bs4 import BeautifulSoup
 
 # ── Konfiguráció ──────────────────────────────────────────────────────────────
 BASE_URL = "https://arveres.mbvk.hu"
-DB_PATH = "mbvk_v11.db"
-MAX_PRICE = 1_000_000
-COUNTIES = []  # pl. ["Békés"]
-
+DB_PATH = "mbvk.db"
+MAX_PRICE = 1_000_000          # Ft
+COUNTIES = []                  # pl. ["Békés"]
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -46,68 +44,51 @@ def mark_seen(conn, auction_id):
 # ── Adatok kinyerése a renderelt HTML-ből ─────────────────────────────────────
 def extract_from_rendered_html(html: str, url: str) -> Dict:
     soup = BeautifulSoup(html, 'html.parser')
-
     # Cím
     cim_elem = soup.select_one("li.location p")
     cim = cim_elem.get_text(strip=True) if cim_elem else "N/A"
-
-    # Telekméret (description-ből)
+    # Telekméret
     desc_elem = soup.select_one("div.description")
     desc = desc_elem.get_text() if desc_elem else ""
     area_match = re.search(r"(\d+(?:[.,]\d+)?)\s*m[²2]", desc, re.IGNORECASE)
     telek = float(area_match.group(1).replace(",", ".")) if area_match else None
-
-    # Árverési adatok
+    # Árak
     min_price_elem = soup.select_one("li.min-price span:last-child")
     min_price = parse_price(min_price_elem.get_text()) if min_price_elem else None
-
     starting_price_elem = soup.select_one("li.starting-price span:last-child")
     starting_price = parse_price(starting_price_elem.get_text()) if starting_price_elem else None
-
     bid_step_elem = soup.select_one("li.bidding-ladder span:last-child")
     bid_step = parse_price(bid_step_elem.get_text()) if bid_step_elem else None
-
     down_pay_elem = soup.select_one("li.down-payment span:last-child")
     down_pay = parse_price(down_pay_elem.get_text()) if down_pay_elem else None
-
     end_date_elem = soup.select_one("li.end-date p")
     end_date = end_date_elem.get_text(strip=True) if end_date_elem else None
-
-    # Tulajdoni hányad (li.data-row)
+    # Tulajdoni hányad
     ownership = None
     for li in soup.select("li.data-row"):
         spans = li.find_all("span")
         if len(spans) >= 2 and "tulajdoni hányad" in spans[0].get_text().lower():
             ownership = spans[1].get_text(strip=True)
             break
-
-    # Licit adatok
+    # Licitnapló
     bid_count = len(soup.select(".table-wrapper tbody tr"))
     highest_bid_elem = soup.select_one(".table-wrapper tbody tr td:nth-child(2) strong")
     highest_bid = parse_price(highest_bid_elem.get_text()) if highest_bid_elem else None
-
     # Képek
     images = []
     for img in soup.select(".desktop-gallery .img-button img, .mobile-gallery img"):
         src = img.get("src") or img.get("data-src")
         if src and src.startswith("http"):
             images.append(src)
-
     # Ügyszám
     case_elem = soup.select_one("h1")
-    case_number = ""
-    if case_elem:
-        match = re.search(r"Ügyszám:\s*([^\<]+)", case_elem.get_text())
-        if match:
-            case_number = match.group(1).strip()
-
-    # Város kinyerése a címből (pl. "5530 Vésztő, ...")
+    case_number = re.search(r"Ügyszám:\s*([^\<]+)", case_elem.get_text()).group(1).strip() if case_elem else ""
+    # Település
     telepules = ""
     if cim != "N/A":
         parts = cim.split(",")
         if parts:
             telepules = parts[0].split()[-1] if len(parts[0].split()) > 1 else ""
-
     return {
         "url": url,
         "case_number": case_number,
@@ -145,7 +126,7 @@ def share_accepted(hanyad: Optional[str]) -> bool:
 
 def passes_filters(data: Dict) -> bool:
     if COUNTIES:
-        # megye nincs a HTML-ben, ezért ezt a szűrőt kihagyjuk, vagy később bővíthető
+        # itt ki lehet egészíteni megye ellenőrzéssel (ha a címből kinyerhető)
         pass
     if data.get("end_date"):
         try:
@@ -166,6 +147,7 @@ def send_telegram_photo(photo_url: str, caption: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
+        import requests
         img_data = requests.get(photo_url, timeout=10).content
         files = {'photo': img_data}
         data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
@@ -174,6 +156,7 @@ def send_telegram_photo(photo_url: str, caption: str):
         log.error("Kép küldés hiba: %s", e)
 
 def send_telegram(data: Dict):
+    import requests
     lines = ["🏠 *ÚJ MBVK ÁRVERÉS*", ""]
     if data.get("cim"):
         lines.append(f"📍 *Cím:* {data['cim']}")
@@ -201,88 +184,76 @@ def send_telegram(data: Dict):
         encoded = urllib.parse.quote(data["cim"])
         lines.append(f"🗺️ [Térkép](https://www.google.com/maps/search/?api=1&query={encoded})")
     lines.append(f"🔗 [Részletek]({data['url']})")
-
     text = "\n".join(lines)
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                       json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
     except Exception as e:
         log.error("Telegram hiba: %s", e)
-
     for i, img in enumerate(data.get("images", [])[:3]):
         send_telegram_photo(img, f"Kép {i+1}")
 
-# ── Főprogram – listát a böngésző segítségével szerezzük ─────────────────────
-def get_auction_list_from_page(page, base_url):
-    """Lekéri az összes beköltözhető árverés linkjét az első oldalról."""
-    page.goto(f"{base_url}/arveresi-hirdetmenyek?moveln=true&phaseCode=normal_ingatlan_2021")
+# ── Összes árverés linkjének begyűjtése a böngészővel ────────────────────────
+def get_all_auction_links(page):
+    """Végigmegy a lapozón, és összegyűjti az összes árverés linkjét."""
+    links = set()
+    page.goto(f"{BASE_URL}/arveresi-hirdetmenyek?moveln=true&phaseCode=normal_ingatlan_2021")
     page.wait_for_selector("div.auction-item, .auction-list-item", timeout=10000)
-    html = page.content()
-    soup = BeautifulSoup(html, 'html.parser')
-    links = []
-    for a in soup.select("a[href*='/arveres-reszletek/']"):
-        href = a.get("href")
-        if href and href not in links:
-            links.append(href)
-    return [f"{base_url}{link}" if link.startswith("/") else link for link in links]
+    while True:
+        html = page.content()
+        soup = BeautifulSoup(html, 'html.parser')
+        for a in soup.select("a[href*='/arveres-reszletek/']"):
+            href = a.get("href")
+            if href:
+                full_url = href if href.startswith("http") else BASE_URL + href
+                links.add(full_url)
+        # Megkeressük a következő oldal gombot
+        next_btn = page.query_selector("a.next:visible, a[rel='next']:visible, button:has-text('Következő'):visible")
+        if not next_btn or next_btn.get_attribute("disabled") is not None:
+            break
+        next_btn.click()
+        page.wait_for_timeout(2000)
+    return list(links)
 
 def run():
     log.info("MBVK Monitor indítás (Playwright) – %s", datetime.now().isoformat())
     conn = init_db()
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        # Beállítjuk a fejléceket, hogy úgy nézzen ki, mint egy böngésző
         page.set_extra_http_headers({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://arveres.mbvk.hu/",
-            "X-Requested-With": "XMLHttpRequest"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.8",
         })
-
-        # Lekérjük az összes árverés linkjét (egyszerűen az első oldalról)
-        # Valós monitorozáshoz lapozni kellene, de itt most csak az első 50-100 linket nézzük
-        urls = get_auction_list_from_page(page, BASE_URL)
-        log.info("Talált %d árverési link", len(urls))
-
+        urls = get_all_auction_links(page)
+        log.info("Összesen %d árverési link található", len(urls))
         new_count = notified_count = 0
-        for url in urls[:100]:  # korlátozzuk a teszteléshez
-            # Kivesszük az auction_id-t az URL-ből (az utolsó szám)
+        for url in urls[:100]:  # teszteléshez max 100
             match = re.search(r"/(\d+)$", url)
             auction_id = match.group(1) if match else None
             if not auction_id or not is_new(conn, auction_id):
                 continue
-
             new_count += 1
             log.info("Feldolgozás: %s", auction_id)
-            page.goto(url, timeout=30000)
-            # Várjuk, hogy megjelenjen a cím (legalább egy .location elem)
             try:
-                page.wait_for_selector("li.location", timeout=10000)
-            except:
-                log.warning("Nem töltött be a tartalom: %s", url)
+                page.goto(url, timeout=30000)
+                page.wait_for_selector("li.location, .auction-description", timeout=10000)
+                html = page.content()
+                data = extract_from_rendered_html(html, url)
+                if passes_filters(data):
+                    log.info("✅ Értesítés küldése: %s", auction_id)
+                    send_telegram(data)
+                    notified_count += 1
+                else:
+                    log.info("❌ Nem felel meg a szűrőknek: %s", auction_id)
                 mark_seen(conn, auction_id)
-                continue
-
-            html = page.content()
-            data = extract_from_rendered_html(html, url)
-
-            log.info("Cím: %s, ár: %s, tul.hányad: %s", data["cim"], data["current_price"], data["ownership_share"])
-
-            if passes_filters(data):
-                log.info("✅ Értesítés küldése")
-                send_telegram(data)
-                notified_count += 1
-            else:
-                log.info("❌ Nem felel meg a szűrőknek")
-
-            mark_seen(conn, auction_id)
-            time.sleep(2)
-
+                time.sleep(2)
+            except Exception as e:
+                log.error("Hiba a %s feldolgozásakor: %s", url, e)
+                mark_seen(conn, auction_id)
         browser.close()
-
-    log.info("Kész. Új: %d, értesítve: %d", new_count, notified_count)
+    log.info("Kész. Új: %d, értesített: %d", new_count, notified_count)
 
 if __name__ == "__main__":
     run()
