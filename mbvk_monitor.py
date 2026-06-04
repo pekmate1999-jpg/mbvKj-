@@ -50,7 +50,7 @@ def load_telepules_map():
 # ── Konfiguráció ──────────────────────────────────────────────────────────────
 BASE_URL  = "https://arveres.mbvk.hu"
 API_BASE  = "https://arveres.mbvk.hu/publicapi"
-DB_PATH   = "mbvk_v7.db"
+DB_PATH   = "mbvk_v8.db"
 MAX_PRICE = 1_000_000
 
 # Budapest koordinátái (geocoding fallback)
