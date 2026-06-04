@@ -2,9 +2,9 @@ name: MBVK Monitor
 
 on:
   schedule:
-    - cron: '0 6,18 * * *'   
+    # 23-as percre és 4,15-ös UTC órára állítva (Magyarul kb. 06:23 és 17:23)
+    - cron: '23 4,15 * * *'   
   workflow_dispatch:
-
 # 👇 EZ AZ ÚJ RÉSZ: Engedélyezi, hogy a GitHub Action módosíthassa a fájlokat a repódban
 permissions:
   contents: write
