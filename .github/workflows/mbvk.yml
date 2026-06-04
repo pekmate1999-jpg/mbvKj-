@@ -18,11 +18,19 @@ jobs:
           
       - name: Install dependencies
         run: |
-          pip install playwright beautifulsoup4 requests
-          playwright install chromium
+          python -m pip install --upgrade pip
+          pip install requests geopy
           
       - name: Run monitor
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python mbvk_monitor.py
+
+      # Az alábbi rész biztosítja, hogy az adatbázis módosításai megmaradjanak
+      - name: Commit and push changes
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add mbvk_v7.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update database" && git push)
