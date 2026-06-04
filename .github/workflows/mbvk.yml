@@ -74,6 +74,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEBUG_HTML: ${{ vars.DEBUG_HTML || '0' }}
         run: python mbvk_monitor.py
 
       - name: Upload database artifact
