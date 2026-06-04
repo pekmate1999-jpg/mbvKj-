@@ -12,18 +12,15 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          MSG="MBVK Monitor Telegram teszt - mukodik! $(date)"
           RESPONSE=$(curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=✅ MBVK Monitor Telegram teszt - működik! $(date)" \
-            -d "parse_mode=Markdown")
-          echo "Válasz: $RESPONSE"
-          echo "$RESPONSE" | python3 -c "
-import sys, json
-r = json.load(sys.stdin)
-if r.get('ok'):
-    print('SIKERES: üzenet elküldve')
-else:
-    print('HIBA:', r.get('description'))
-    sys.exit(1)
-"
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":\"${MSG}\"}")
+          echo "Valasz: $RESPONSE"
+          if echo "$RESPONSE" | grep -q '"ok":true'; then
+            echo "SIKERES: uzenet elkulve"
+          else
+            echo "HIBA!"
+            exit 1
+          fi
