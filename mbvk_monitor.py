@@ -532,14 +532,13 @@ def send_telegram(data: Dict):
     lines.append("🚪 *Beköltözhető:* igen")
     if hanyad_str:
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad_str}")
-    if end_str:
+        if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
-        
-    # 👇 EZT A SORT SZÚRD BE AZ IDŐVONALHOZ
-    lines.append(f"📊 *Státusz:* {timeline}")
-    
+
+    lines.append(f"📊 *Státusz:* {timeline}")   # ugyanannyi szóközzel, mint a felette lévő sorok
+
     if leiras:
-        lines.append(f"\n📝 _{leiras}_")      
+        lines.append(f"\n📝 _{leiras}_")
         
     lines.append("")
     lines.append(f"🔗 [Részletek az MBVK oldalon]({data.get('url', '')})")
