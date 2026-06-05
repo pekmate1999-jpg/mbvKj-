@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v5.3 – Beköltözhető ingatlanok (moveln=true)
+MBVK Árverési Monitor v6.0 – Beköltözhető ingatlanok (moveln=true)
 Szűrés: tulajdoni hányad (1/1 vagy 1/2+1/2) és max ár 1M Ft
 
-Változások (v5.3):
-  - Licitfigyelés eltávolítva: A licit száma már nem vált ki értesítést.
-  - Szigorított értesítési logika: Csak teljesen új ingatlanról, 
-    vagy árcsökkenés (korábbi ár > jelenlegi ár) esetén küld üzenetet.
+Változások (v6.0):
+  - Új ingatlan már meglévő licittel → „új licit” értesítés (nem sima „új”)
+  - Markdown karakterek escape-elése a Telegram üzenetben (robusztusabb)
+  - Dátum összehasonlítás datetime objektumokkal a date_moved_closer esetén
+  - Figyelmeztetés, ha Telegram token vagy chat ID hiányzik
+  - Belső kódtisztítás: felesleges import alias eltávolítva
 """
 
 import csv
@@ -22,7 +24,6 @@ from typing import Optional, List, Dict, Tuple
 from urllib.parse import quote_plus
 
 import requests
-
 
 # geopy opcionális – ha nincs telepítve, a távolság-funkció ki van kalkulálva
 try:
@@ -71,41 +72,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── SQLite ────────────────────────────────────────────────────────────────────
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
-    # Alap tábla létrehozása, ha teljesen szűz lenne az adatbázis
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS properties (
-            auction_id  TEXT PRIMARY KEY,
-            created_at  TEXT,
-            notified_at TEXT,
-            price       INTEGER
-        )
-    """)
-    # Létező oszlopok lekérése a meglévő adatbázisból
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(properties)")}
-    
-    # 👇 HA HIÁNYZIK VALAMELYIK OSZLOP A RÉGI ADATBÁZISODBÓL, ITT AUTOMATIKUSAN HOZZÁADJUK
-    if "created_at" not in cols:
-        conn.execute("ALTER TABLE properties ADD COLUMN created_at TEXT")
-        log.info("DB séma frissítve: created_at oszlop hozzáadva")
-    if "notified_at" not in cols:
-        conn.execute("ALTER TABLE properties ADD COLUMN notified_at TEXT")
-        log.info("DB séma frissítve: notified_at oszlop hozzáadva")
-    if "price" not in cols:
-        conn.execute("ALTER TABLE properties ADD COLUMN price INTEGER")
-        log.info("DB séma frissítve: price oszlop hozzáadva")
-    if "licit_szam" not in cols:
-        conn.execute("ALTER TABLE properties ADD COLUMN licit_szam INTEGER")
-        log.info("DB séma frissítve: licit_szam oszlop hozzáadva")
-    if "arveres_vege" not in cols:
-        conn.execute("ALTER TABLE properties ADD COLUMN arveres_vege TEXT")
-        log.info("DB séma frissítve: arveres_vege oszlop hozzáadva")
-
-    return conn
-
 # ── Segédfüggvények ───────────────────────────────────────────────────────────
 def normalize(text: str) -> str:
     nfkd = unicodedata.normalize("NFKD", text.lower())
@@ -128,6 +94,16 @@ def parse_area(val) -> Optional[float]:
         except ValueError:
             pass
     return None
+
+def escape_markdown(text: str) -> str:
+    """
+    Escape special characters for Telegram Markdown (legacy) mode.
+    Characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    """
+    if not text:
+        return ""
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
@@ -266,19 +242,17 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
         log.warning("Részlet API hiba (%s/%s): %s", exec_id, auction_id, exc)
         return None
 
-def _parse_dt(s: str) -> Optional["datetime.datetime"]:
+def _parse_dt(s: str) -> Optional[datetime]:
     """ISO/pont formátumú dátumstring -> datetime, vagy None."""
-    import datetime as _dt
     if not s or s == "N/A":
         return None
     s2 = s.split("T")[0].split()[0].replace(".", "-").strip("-")
     for fmt in ("%Y-%m-%d", "%Y-%m"):
         try:
-            return _dt.datetime.strptime(s2, fmt)
+            return datetime.strptime(s2, fmt)
         except ValueError:
             continue
     return None
-
 
 def estimate_phase_ends(
     arveres_kezdete: str,
@@ -350,13 +324,12 @@ def estimate_phase_ends(
 
     return []
 
-
 def generate_timeline(
     kezdete: str,
     vege: str,
     kiki_ar: Optional[int],
     min_ar: Optional[int],
-    phase_ends: Optional[List[str]] = None,   # ← ÚJ: opcionális szakasz-határok listája
+    phase_ends: Optional[List[str]] = None,
 ) -> str:
     """
     Vizuális haladás-sáv + szakasz info a Telegram üzenethez.
@@ -419,6 +392,39 @@ def generate_timeline(
         ratio_text = f" ({int(min_ar / kiki_ar * 100)}%)"
 
     return f"{bar_str}\n*{final_stage}. szakasz{ratio_text}*"
+
+# ── Adatbázis (SQLite) ────────────────────────────────────────────────────────
+def init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS properties (
+            auction_id  TEXT PRIMARY KEY,
+            created_at  TEXT,
+            notified_at TEXT,
+            price       INTEGER
+        )
+    """)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(properties)")}
+    
+    if "created_at" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN created_at TEXT")
+        log.info("DB séma frissítve: created_at oszlop hozzáadva")
+    if "notified_at" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN notified_at TEXT")
+        log.info("DB séma frissítve: notified_at oszlop hozzáadva")
+    if "price" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN price INTEGER")
+        log.info("DB séma frissítve: price oszlop hozzáadva")
+    if "licit_szam" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN licit_szam INTEGER")
+        log.info("DB séma frissítve: licit_szam oszlop hozzáadva")
+    if "arveres_vege" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN arveres_vege TEXT")
+        log.info("DB séma frissítve: arveres_vege oszlop hozzáadva")
+
+    return conn
+
 # ── Adatkinyerés ──────────────────────────────────────────────────────────────
 def extract(data: Dict) -> Dict:
     def g(*keys):
@@ -497,10 +503,6 @@ def extract(data: Dict) -> Dict:
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
     arveres_kezdete = g("auctionStartDate", "startDate", "auctionStart", "kezdet", "kibocsatasDatuma")
 
-    # Megjegyzés: az API nem adja vissza a szakasz-táblázatot.
-    # A phase_end_dates-t az estimate_phase_ends() tölti fel a run()-ban,
-    # és kívülről kerül a data dict-be. Az extract() ezt nem kezeli.
-
     return {
         "megye":              megye,
         "telepules":          telepules,
@@ -549,13 +551,7 @@ def passes_filters(data: Dict) -> bool:
 
     end_date_str = data.get("arveres_vege")
     if end_date_str and end_date_str != "N/A":
-        end_date = None
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                end_date = datetime.strptime(end_date_str.replace("T", " ").split(".")[0], fmt)
-                break
-            except ValueError:
-                continue
+        end_date = _parse_dt(end_date_str)
         if end_date and end_date < datetime.now():
             return False
 
@@ -574,13 +570,14 @@ def send_telegram(data: Dict, indok: str = "új"):
         log.warning("Telegram nincs beállítva (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID hiányzik)")
         return
 
-    cim      = data.get("cim")
+    # Alapadatok escape-elése
+    cim      = escape_markdown(data.get("cim", "N/A"))
     price    = data.get("price")
     legh     = data.get("legmagasabb_licit")
     licit_n  = data.get("licitek_szama", 0)
-    hanyad   = data.get("tulajdoni_hanyad")
+    hanyad   = escape_markdown(data.get("tulajdoni_hanyad", "")) if data.get("tulajdoni_hanyad") else None
     end      = data.get("arveres_vege")
-    leiras   = data.get("leiras", "")
+    leiras   = escape_markdown(data.get("leiras", ""))
     telepules = data.get("telepules")
 
     telek_m   = data.get("telek_meret")
@@ -589,8 +586,8 @@ def send_telegram(data: Dict, indok: str = "új"):
     epulet_f  = data.get("epulet_forras")
     ft_m2     = data.get("ft_per_m2")
 
-    dist_km = bp_distance_km(telepules, cim)
-    maps_url = google_maps_url(cim)
+    dist_km = bp_distance_km(telepules, data.get("cim"))
+    maps_url = google_maps_url(data.get("cim"))
 
     def fmt_area(val: Optional[float], forras: Optional[str]) -> Optional[str]:
         if val is None:
@@ -606,23 +603,19 @@ def send_telegram(data: Dict, indok: str = "új"):
     telek_str  = fmt_area(telek_m, telek_f)
     epulet_str = fmt_area(epulet_m, epulet_f)
     ft_m2_str  = f"{ft_m2:,} Ft/m²".replace(",", " ") if ft_m2    else None
-    hanyad_str = hanyad                                 if hanyad   else None
     def fmt_date(s: Optional[str]) -> Optional[str]:
-        """'2026-07-30T12:00:00' → '2026-07-30 12:00'"""
         if not s or s == "N/A":
             return None
-        return s.replace("T", " ")[:16]   # levágja a másodperceket is
+        return s.replace("T", " ")[:16]
     end_str    = fmt_date(end)
     dist_str   = f"{dist_km:.0f} km"                   if dist_km is not None else None
-# ... (A korábbi változódeklarációid: price_str, legh_str, stb. után) ...
 
-    # 👇 ITT GENERÁLJUK LE AZ ÚJ INFÓT
     timeline = generate_timeline(
         data.get("arveres_kezdete", ""),
         data.get("arveres_vege", ""),
         data.get("kikialtas_ar"),
         data.get("minimum_ar"),
-        data.get("phase_end_dates") or None,   # ← ÚJ: tényleges szakaszhatárok
+        data.get("phase_end_dates") or None,
     )
 
     INDOK_EMOJI = {
@@ -657,7 +650,7 @@ def send_telegram(data: Dict, indok: str = "új"):
     if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
 
-    lines.append(f"📊 *Státusz:* {timeline}")   # ugyanannyi szóközzel, mint a felette lévő sorok
+    lines.append(f"📊 *Státusz:* {timeline}")
 
     if leiras:
         lines.append(f"\n📝 _{leiras}_")
@@ -690,9 +683,11 @@ def send_telegram(data: Dict, indok: str = "új"):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor v5.3 indítás – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor v6.0 indítás – %s", datetime.now().isoformat())
     if not GEOPY_OK:
         log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram beállítások hiányoznak – értesítések nem lesznek elküldve.")
 
     conn = init_db()
     session = requests.Session()
@@ -733,7 +728,7 @@ def run():
         data["auction_id"] = auction_id
         data["url"] = url
 
-        # Szakasz-határok becslése az 1. szakasz végéből (Vht. 145/B. § – egyenlő hossz)
+        # Szakasz-határok becslése
         phase_ends = estimate_phase_ends(
             data.get("arveres_kezdete", ""),
             data.get("arveres_vege", ""),
@@ -754,7 +749,7 @@ def run():
             data.get("licitek_szama"),
         )
 
-        # Korábbi adatok lekérése az összehasonlításhoz
+        # Korábbi adatok lekérése
         existing = conn.execute(
             "SELECT price, licit_szam, arveres_vege FROM properties WHERE auction_id = ?",
             (auction_id,)
@@ -769,7 +764,11 @@ def run():
         indok: Optional[str] = None
 
         if is_new:
-            indok = "új"
+            # 🔔 ÚJ: ha az ingatlan már rendelkezik licittel, akkor "új licit" értesítés
+            if current_licits > 0:
+                indok = "új licit"
+            else:
+                indok = "új"
             conn.execute(
                 """INSERT INTO properties (auction_id, created_at, price, licit_szam, arveres_vege)
                    VALUES (?, ?, ?, ?, ?)""",
@@ -781,11 +780,11 @@ def run():
 
             price_decreased  = prev_price  is not None and current_price  is not None and current_price  < prev_price
             licit_increased  = prev_licits is not None and current_licits is not None and current_licits > prev_licits
-            # "új dátum": a végdátum közelebb került (licit érkezett, szakasz lezárult)
-            date_moved_closer = (
-                prev_vege and current_vege and current_vege != "N/A" and prev_vege != "N/A"
-                and current_vege < prev_vege   # korábbi dátum = közelebb
-            )
+
+            # 🔧 Dátum összehasonlítás datetime objektumokkal
+            prev_dt = _parse_dt(prev_vege) if prev_vege and prev_vege != "N/A" else None
+            curr_dt = _parse_dt(current_vege) if current_vege and current_vege != "N/A" else None
+            date_moved_closer = prev_dt and curr_dt and curr_dt < prev_dt
 
             if price_decreased:
                 indok = "árcsökkenés"
@@ -796,7 +795,7 @@ def run():
             elif licit_increased:
                 indok = "új licit"
 
-            # Adatbázis frissítése minden változáskor (értesítéstől függetlenül)
+            # Adatbázis frissítése minden változáskor
             if price_decreased or licit_increased or date_moved_closer:
                 conn.execute(
                     """UPDATE properties
