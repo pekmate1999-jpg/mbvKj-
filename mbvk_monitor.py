@@ -692,6 +692,9 @@ def send_telegram(data: Dict, indok: str = "új"):
         lines.append(f"📅 *Árverés vége:* {end_str}")
 
     lines.append(f"📊 *Státusz:* {timeline}")
+  
+    if end_str:
+        lines.append(f"📅 *Árverés vége:* {end_str}")
 
     if leiras:
         lines.append(f"\n📝 _{leiras}_")
