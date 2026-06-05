@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v6.0 – Beköltözhető ingatlanok (moveln=true)
+MBVK Árverési Monitor v6.01 – Beköltözhető ingatlanok (moveln=true)
 Szűrés: tulajdoni hányad (1/1 vagy 1/2+1/2) és max ár 1M Ft
 
-Változások (v6.0):
-  - Új ingatlan már meglévő licittel → „új licit” értesítés (nem sima „új”)
-  - Markdown karakterek escape-elése a Telegram üzenetben (robusztusabb)
-  - Dátum összehasonlítás datetime objektumokkal a date_moved_closer esetén
-  - Figyelmeztetés, ha Telegram token vagy chat ID hiányzik
-  - Belső kódtisztítás: felesleges import alias eltávolítva
-  - Javítva: NameError a hanyad_str használatánál (helyette hanyad)
+Változások (v6.01):
+  - Megjelennek a szakaszok végdátumai (ha elérhetők)
+  - Megjelennek a szakaszonkénti minimális vételárak (1., 2., 3. szakasz)
+  - Egyéb fejlesztések az előző verzióból (markdown escape, dátumösszehasonlítás, stb.)
 """
 
 import csv
@@ -265,13 +262,6 @@ def estimate_phase_ends(
     """
     MBVK szakasz-határok becslése az API adatokból (Vht. 145/B. §).
     A szakaszok mindig egyenlő hosszúak.
-
-    Az API endDate viselkedése:
-      - Nincs licit (licit_szam==0)  → 3. szakasz végét adja → visszaosztjuk harmadra
-      - Van licit, total_days 5-30   → 1. szakasz vége → előre számolunk ×3
-      - Van licit, total_days 30-50  → 2. szakasz vége → visszaszámolunk /2, majd ×3
-      - Van licit, total_days 50-75  → 3. szakasz vége → visszaszámolunk /3
-      - Min ár elérve (lezárult)     → csak 1 végdátum, az a tényleges vége
     """
     import datetime as _dt2
     start_dt   = _parse_dt(arveres_kezdete)
@@ -285,11 +275,11 @@ def estimate_phase_ends(
     def fmt(dt) -> str:
         return f"{dt.strftime('%Y-%m-%d')}T{time_part}"
 
-    # C: minimum ár elérve → lezárult az aktuális szakasszal
+    # minimum ár elérve -> lezárult
     if licit_szam and minimum_ar and kikialtas_ar and minimum_ar >= kikialtas_ar:
         return [fmt(api_end_dt)]
 
-    # A: nincs licit → API a 3. szakasz végét adja
+    # nincs licit -> API a 3. szakasz végét adja
     if licit_szam == 0:
         if total_days >= 45:
             sd = round(total_days / 3)
@@ -298,9 +288,9 @@ def estimate_phase_ends(
                 fmt(start_dt + _dt2.timedelta(days=sd * 2)),
                 fmt(api_end_dt),
             ]
-        return []  # rövid + nincs licit → ismeretlen
+        return []
 
-    # B: van licit → API az aktuális szakasz végét adja; total_days alapján meghatározzuk melyiket
+    # van licit -> API az aktuális szakasz végét adja
     if 5 <= total_days <= 30:           # 1. szakasz vége
         sd = total_days
         return [
@@ -315,7 +305,7 @@ def estimate_phase_ends(
             fmt(api_end_dt),
             fmt(api_end_dt + _dt2.timedelta(days=sd)),
         ]
-    elif 50 < total_days <= 75:         # 3. szakasz vége (licit a végén)
+    elif 50 < total_days <= 75:         # 3. szakasz vége
         sd = total_days // 3
         return [
             fmt(start_dt + _dt2.timedelta(days=sd)),
@@ -334,13 +324,6 @@ def generate_timeline(
 ) -> str:
     """
     Vizuális haladás-sáv + szakasz info a Telegram üzenethez.
-
-    A szakasz meghatározásának prioritása:
-      1. Ha phase_ends át van adva (az API tényleges fázis-végdátumai), ezeket
-         használjuk a szakaszhatárokhoz. Az aktuális dátum alapján meghatározzuk
-         melyik fázisban vagyunk.
-      2. Ha nincs phase_ends, az időarány alapján egyenlő harmadokra osztjuk
-         a teljes árverési időszakot (régi viselkedés – fallback).
     """
     import datetime as _dt
 
@@ -359,27 +342,20 @@ def generate_timeline(
     elapsed  = (now_dt - start_dt).total_seconds()
     progress = max(0.0, min(1.0, elapsed / total_sec))
 
-    # ── Vizuális sáv ──────────────────────────────────────────────────────────
     filled = int(progress * 15)
     blocks = ["█" if i < filled else "░" for i in range(15)]
     bar_str = f"`[{''.join(blocks[0:5])}|{''.join(blocks[5:10])}|{''.join(blocks[10:15])}]` {int(progress * 100)}%"
 
-    # ── Szakasz meghatározása ─────────────────────────────────────────────────
-    final_stage = 1   # alapértelmezett
-
+    final_stage = 1
     if phase_ends:
-        # Tényleges fázis-végdátumok alapján: az első olyan fázis amelynek
-        # a vége még a jövőben van → abban a fázisban vagyunk.
         parsed_ends = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
         for idx, ph_end in enumerate(parsed_ends, start=1):
             if now_dt <= ph_end:
                 final_stage = idx
                 break
         else:
-            # Minden fázis lejárt – az utolsóban vagyunk
             final_stage = len(parsed_ends)
     else:
-        # Fallback: egyenlő harmadok az idő alapján
         if progress < 0.333:
             final_stage = 1
         elif progress < 0.666:
@@ -387,12 +363,38 @@ def generate_timeline(
         else:
             final_stage = 3
 
-    # ── Ár-arány (csak megjelenítési info) ────────────────────────────────────
     ratio_text = ""
     if kiki_ar and min_ar and kiki_ar > 0:
         ratio_text = f" ({int(min_ar / kiki_ar * 100)}%)"
 
     return f"{bar_str}\n*{final_stage}. szakasz{ratio_text}*"
+
+# ── Szakasz árak kiszámítása ─────────────────────────────────────────────────
+def calculate_phase_prices(kikialtas_ar: Optional[int]) -> Optional[Tuple[int, int, int]]:
+    """
+    Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban).
+    Szabály: 1. szakasz: kikiáltási ár
+             2. szakasz: kikiáltási ár * 2/3
+             3. szakasz: kikiáltási ár / 2
+    """
+    if not kikialtas_ar or kikialtas_ar <= 0:
+        return None
+    stage1 = kikialtas_ar
+    stage2 = int(kikialtas_ar * 2 / 3)
+    stage3 = int(kikialtas_ar / 2)
+    return (stage1, stage2, stage3)
+
+def format_phase_prices(prices: Tuple[int, int, int]) -> str:
+    """Formázza a szakasz árakat: '1,000,000 Ft / 666,666 Ft / 500,000 Ft'"""
+    return f"{prices[0]:,} Ft / {prices[1]:,} Ft / {prices[2]:,} Ft".replace(",", " ")
+
+def format_phase_dates(phase_ends: Optional[List[str]]) -> Optional[str]:
+    """Formázza a szakasz végdátumokat: '2025-06-10, 2025-06-17, 2025-06-24'"""
+    if not phase_ends or len(phase_ends) < 2:
+        return None
+    # Csak a dátum rész kell (YYYY-MM-DD)
+    dates = [end.split("T")[0] for end in phase_ends if end]
+    return ", ".join(dates)
 
 # ── Adatbázis (SQLite) ────────────────────────────────────────────────────────
 def init_db() -> sqlite3.Connection:
@@ -619,6 +621,11 @@ def send_telegram(data: Dict, indok: str = "új"):
         data.get("phase_end_dates") or None,
     )
 
+    # ── ÚJ: szakasz árak és végdátumok ───────────────────────────────────────
+    phase_prices = calculate_phase_prices(data.get("kikialtas_ar"))
+    phase_prices_str = format_phase_prices(phase_prices) if phase_prices else None
+    phase_dates_str = format_phase_dates(data.get("phase_end_dates"))
+
     INDOK_EMOJI = {
         "új":        "🆕",
         "új licit":  "🔔",
@@ -633,9 +640,13 @@ def send_telegram(data: Dict, indok: str = "új"):
     if dist_str:
         lines.append(f"🗺 *Budapest-távolság:* {dist_str}")
     if price_str:
-        lines.append(f"💰 *Ár:* {price_str}")
+        lines.append(f"💰 *Jelenlegi ár:* {price_str}")
     if legh_str:
         lines.append(f"📈 *Legmagasabb licit:* {legh_str}")
+
+    # Szakasz árak kiírása (ha van)
+    if phase_prices_str:
+        lines.append(f"💰 *Szakasz árak (1./2./3.):* {phase_prices_str}")
 
     if telek_str:
         lines.append(f"🏕 *Telekméret:* {telek_str}")
@@ -644,10 +655,14 @@ def send_telegram(data: Dict, indok: str = "új"):
     if ft_m2_str:
         lines.append(f"💹 *Ft/m²:* {ft_m2_str}")
     lines.append("🚪 *Beköltözhető:* igen")
-    if hanyad:                     # Javítás: hanyad_str -> hanyad
+    if hanyad:
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad}")
     if licit_str:
         lines.append(f"🔄 *Licitek száma:* {licit_str}")
+
+    # Szakaszok végdátumai (ha van)
+    if phase_dates_str:
+        lines.append(f"📅 *Szakaszok vége:* {phase_dates_str}")
     if end_str:
         lines.append(f"⏳ *Árverés vége:* {end_str}")
 
@@ -684,7 +699,7 @@ def send_telegram(data: Dict, indok: str = "új"):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor v6.0 indítás – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor v6.01 indítás – %s", datetime.now().isoformat())
     if not GEOPY_OK:
         log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -765,7 +780,6 @@ def run():
         indok: Optional[str] = None
 
         if is_new:
-            # 🔔 Új ingatlan, de ha már van licitje, akkor "új licit" értesítés
             if current_licits > 0:
                 indok = "új licit"
             else:
@@ -782,7 +796,6 @@ def run():
             price_decreased  = prev_price  is not None and current_price  is not None and current_price  < prev_price
             licit_increased  = prev_licits is not None and current_licits is not None and current_licits > prev_licits
 
-            # Dátum összehasonlítás datetime objektumokkal
             prev_dt = _parse_dt(prev_vege) if prev_vege and prev_vege != "N/A" else None
             curr_dt = _parse_dt(current_vege) if current_vege and current_vege != "N/A" else None
             date_moved_closer = prev_dt and curr_dt and curr_dt < prev_dt
@@ -796,7 +809,6 @@ def run():
             elif licit_increased:
                 indok = "új licit"
 
-            # Adatbázis frissítése minden változáskor
             if price_decreased or licit_increased or date_moved_closer:
                 conn.execute(
                     """UPDATE properties
