@@ -668,11 +668,11 @@ def send_telegram(data: Dict, indok: str = "új"):
         lines.append(f"📈 *Legmagasabb licit:* {legh_str}")
 
     if phase_prices_str:
-        lines.append(f"💰 *Szakasz árak (1./2./3.):* {phase_prices_str}")
+        lines.append(f"💰 *Szakasz árak:* {phase_prices_str}")
 
     # Szakaszonkénti Ft/m² (ha van referencia terület)
     if phase_ft_per_m2_str:
-        lines.append(f"💹 *Ft/m² (1./2./3.):* {phase_ft_per_m2_str}")
+        lines.append(f"💹 *Ft/m²:* {phase_ft_per_m2_str}")
 
     if telek_str:
         lines.append(f"🏕 *Telekméret:* {telek_str}")
