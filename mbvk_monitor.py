@@ -390,8 +390,8 @@ def calculate_phase_ft_per_m2(phase_prices: Tuple[int, int, int], ref_area: Opti
     )
 
 def format_phase_ft_per_m2(ft_per_m2: Tuple[int, int, int]) -> str:
-    """Formázza a szakaszonkénti Ft/m² értékeket kompaktabban: '260 / 173 / 130'"""
-    return f"{ft_per_m2[0]:,} / {ft_per_m2[1]:,} / {ft_per_m2[2]:,}".replace(",", " ")
+    """Formázza a szakaszonkénti Ft/m² értékeket: '260 Ft/m² / 173 Ft/m² / 130 Ft/m²'"""
+    return f"{ft_per_m2[0]:,} Ft/m² / {ft_per_m2[1]:,} Ft/m² / {ft_per_m2[2]:,} Ft/m²".replace(",", " ")
 
 def format_phase_remaining_days(phase_ends: Optional[List[str]]) -> Optional[str]:
     """
