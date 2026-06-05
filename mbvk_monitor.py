@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v6.04 – Beköltözhető ingatlanok (moveln=true)
+MBVK Árverési Monitor v7.00 – Beköltözhető ingatlanok (moveln=true)
 Kategorizált Telegram üzenet formátummal.
 """
 
@@ -12,7 +12,7 @@ import time
 import sqlite3
 import logging
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple
 from urllib.parse import quote_plus
 
@@ -264,8 +264,6 @@ def calculate_phase_ends(
     Ha a licitek száma eléri a minimum árat (azaz minimum_ar >= kikialtas_ar),
     az árverés az aktuális szakasz végén lezárul – ilyenkor csak 1 dátumot adunk.
     """
-    import datetime as _dt2
-
     start_dt = _parse_dt(arveres_kezdete)
     end_dt   = _parse_dt(arveres_vege)
 
@@ -288,8 +286,8 @@ def calculate_phase_ends(
 
     # Egyenlő szakaszhosszak: teljes időtartam / 3
     phase_sec = total_sec / 3
-    phase1_end = start_dt + _dt2.timedelta(seconds=phase_sec)
-    phase2_end = start_dt + _dt2.timedelta(seconds=phase_sec * 2)
+    phase1_end = start_dt + timedelta(seconds=phase_sec)
+    phase2_end = start_dt + timedelta(seconds=phase_sec * 2)
     phase3_end = end_dt  # pontosan az API-tól kapott vége
 
     # Ha az árverés már lezárult (minimum ár teljesítve), csak a tényleges záró dátumot adjuk
@@ -317,9 +315,7 @@ def generate_timeline(
     A haladás-sáv a TELJES árverés (kezdete→utolsó szakasz vége) alapján számít.
     Az aktuális szakasz meghatározása a phase_ends listából történik.
     """
-    import datetime as _dt
-
-    now_dt = _dt.datetime.now()
+    now_dt = datetime.now()
 
     start_dt = _parse_dt(kezdete)
 
@@ -346,9 +342,8 @@ def generate_timeline(
 
     # Aktuális szakasz: az első olyan szakasz, amelynek vége még nem múlt el
     if phase_ends:
-        parsed_ends_sorted = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
-        current_stage = len(parsed_ends_sorted)  # alapértelmezett: utolsó (lezárult esetén)
-        for idx, ph_end in enumerate(parsed_ends_sorted, start=1):
+        current_stage = len(parsed_ends)  # alapértelmezett: utolsó (lezárult esetén)
+        for idx, ph_end in enumerate(parsed_ends, start=1):
             if now_dt <= ph_end:
                 current_stage = idx
                 break
@@ -409,13 +404,14 @@ def format_phase_remaining_days(phase_ends: Optional[List[str]]) -> Optional[str
     for end_str in phase_ends:
         end_dt = _parse_dt(end_str)
         if end_dt is None:
-            return None
+            days_list.append("?")
+            continue
         delta = (end_dt - now).days
         if delta < 0:
             days_list.append("lejárt")
         else:
             days_list.append(f"{delta} nap")
-    return ", ".join(days_list)
+    return ", ".join(days_list) if days_list else None
 
 # ── Adatbázis (SQLite) ────────────────────────────────────────────────────────
 def init_db() -> sqlite3.Connection:
@@ -489,7 +485,7 @@ def extract(data: Dict) -> Dict:
     kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
     minimum_ar        = parse_price(g("minPrice", "minimumAr", "minimumBid"))
     legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
-    price = legmagasabb_licit or minimum_ar or kikialtas_ar
+    price = next((v for v in (legmagasabb_licit, minimum_ar, kikialtas_ar) if v is not None and v > 0), None)
 
     licit_szam = g("bidCount", "licitekSzama")
     try:
@@ -542,7 +538,6 @@ def extract(data: Dict) -> Dict:
         "is_lakott":          is_lakott,                                 # <-- Új sor
         "bekoltozheto":       "nem (lakott)" if is_lakott else "igen",   # <-- Dinamikus sor
         "price":              price,
-        # ... a többi marad változatlan ...
         "kikialtas_ar":       kikialtas_ar,
         "minimum_ar":         minimum_ar,
         "legmagasabb_licit":  legmagasabb_licit,
@@ -652,7 +647,7 @@ def send_telegram(data: Dict, indok: str = "új"):
     )
 
     # Szakasz árak és szakaszonkénti ft/m²
-    phase_prices = calculate_phase_prices(data.get("kikialtas_ar"))
+    phase_prices = calculate_phase_prices(data.get("kikialtas_ar"), is_lakott=data.get("is_lakott", False))
     phase_prices_str = format_phase_prices(phase_prices) if phase_prices else None
     phase_ft_per_m2 = calculate_phase_ft_per_m2(phase_prices, ref_area) if phase_prices and ref_area else None
     phase_ft_per_m2_str = format_phase_ft_per_m2(phase_ft_per_m2) if phase_ft_per_m2 else None
@@ -683,7 +678,7 @@ def send_telegram(data: Dict, indok: str = "új"):
         lines.append(f"🏕 *Telekméret:* {telek_str}")
     if epulet_str:
         lines.append(f"🏚 *Épület alapterülete:* {epulet_str}")
-    lines.append("🚪 *Beköltözhető:* igen")
+    lines.append(f"🚪 *Beköltözhető:* {data.get('bekoltozheto', 'igen')}")
     lines.append("")
 
     # 3. Pénzügyi Információk
@@ -833,7 +828,7 @@ def run():
             conn.execute(
                 """INSERT INTO properties (auction_id, created_at, price, licit_szam, arveres_vege)
                    VALUES (?, ?, ?, ?, ?)""",
-                (auction_id, datetime.utcnow().isoformat(),
+                (auction_id, datetime.now().isoformat(),
                  current_price, current_licits, current_vege)
             )
         else:
@@ -868,7 +863,7 @@ def run():
             send_telegram(data, indok=indok)
             conn.execute(
                 "UPDATE properties SET notified_at = ? WHERE auction_id = ?",
-                (datetime.utcnow().isoformat(), auction_id)
+                (datetime.now().isoformat(), auction_id)
             )
             notified_count += 1
             if is_new:
