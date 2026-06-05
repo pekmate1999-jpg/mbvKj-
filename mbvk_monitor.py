@@ -9,6 +9,7 @@ Változások (v6.0):
   - Dátum összehasonlítás datetime objektumokkal a date_moved_closer esetén
   - Figyelmeztetés, ha Telegram token vagy chat ID hiányzik
   - Belső kódtisztítás: felesleges import alias eltávolítva
+  - Javítva: NameError a hanyad_str használatánál (helyette hanyad)
 """
 
 import csv
@@ -643,8 +644,8 @@ def send_telegram(data: Dict, indok: str = "új"):
     if ft_m2_str:
         lines.append(f"💹 *Ft/m²:* {ft_m2_str}")
     lines.append("🚪 *Beköltözhető:* igen")
-    if hanyad_str:
-        lines.append(f"📄 *Tulajdoni hányad:* {hanyad_str}")
+    if hanyad:                     # Javítás: hanyad_str -> hanyad
+        lines.append(f"📄 *Tulajdoni hányad:* {hanyad}")
     if licit_str:
         lines.append(f"🔄 *Licitek száma:* {licit_str}")
     if end_str:
@@ -764,7 +765,7 @@ def run():
         indok: Optional[str] = None
 
         if is_new:
-            # 🔔 ÚJ: ha az ingatlan már rendelkezik licittel, akkor "új licit" értesítés
+            # 🔔 Új ingatlan, de ha már van licitje, akkor "új licit" értesítés
             if current_licits > 0:
                 indok = "új licit"
             else:
@@ -781,7 +782,7 @@ def run():
             price_decreased  = prev_price  is not None and current_price  is not None and current_price  < prev_price
             licit_increased  = prev_licits is not None and current_licits is not None and current_licits > prev_licits
 
-            # 🔧 Dátum összehasonlítás datetime objektumokkal
+            # Dátum összehasonlítás datetime objektumokkal
             prev_dt = _parse_dt(prev_vege) if prev_vege and prev_vege != "N/A" else None
             curr_dt = _parse_dt(current_vege) if current_vege and current_vege != "N/A" else None
             date_moved_closer = prev_dt and curr_dt and curr_dt < prev_dt
