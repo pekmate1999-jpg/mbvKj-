@@ -377,8 +377,8 @@ def calculate_phase_prices(kikialtas_ar: Optional[int]) -> Optional[Tuple[int, i
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
     stage1 = kikialtas_ar
-    stage2 = int(kikialtas_ar * 2 / 3)
-    stage3 = int(kikialtas_ar / 2)
+    stage2 = int(kikialtas_ar * 0.7)  # 2/3 helyett 70%
+    stage3 = int(kikialtas_ar / 2)    # 50%
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
