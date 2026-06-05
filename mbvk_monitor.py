@@ -362,20 +362,49 @@ def generate_timeline(
 
     return f"{bar_str}\n*{current_stage}. szakasz{ratio_text}*"
 
-def calculate_phase_prices(kikialtas_ar: Optional[int], is_lakott: bool = False) -> Optional[Tuple[int, int, int]]:
-    """Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban), figyelembe véve a lakottságot."""
+def calculate_phase_prices(
+    kikialtas_ar: Optional[int],
+    ar_tipus: str = "altalanos",
+) -> Optional[Tuple[int, int, int]]:
+    """
+    Visszaadja az 1., 2., 3. szakasz meghirdetett minimális vételárait (Ft-ban).
+
+    Az MBVK rendszere a szakaszokat csökkenő áron hirdeti meg:
+      1. szakasz: kikiáltási ár 90%-a
+      2. szakasz: kikiáltási ár 70%-a
+      3. szakasz: kikiáltási ár 50%-a
+
+    Ezek a MEGHIRDETETT árak. A Vht. 173/A-B. § szerinti törvényi minimumok
+    (az érvényes ajánlat alsó határa) ennél alacsonyabbak lehetnek:
+      - Általános eset:      50% (főszabály)
+      - Lakóingatlan:        70% (ha az adós egyetlen lakóhelye)
+      - Fogyasztói jelzálog: 100% (minden szakaszban)
+
+    A legtöbb esetben a meghirdetett 90/70/50%-os árak a mérvadók,
+    a törvényi minimum csak különleges esetekben tér el.
+
+    ar_tipus hatása: "jelzalog" esetén minden szakasz = 100% (kikiáltási ár).
+    """
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
-    
-    # 1. szakasz: Lakottan 90%, beköltözhetően 100%
-    stage1 = int(kikialtas_ar * 0.9) if is_lakott else kikialtas_ar
-    stage2 = int(kikialtas_ar * 0.7)
-    stage3 = int(kikialtas_ar * 0.5)
-    
+
+    if ar_tipus == "jelzalog":
+        # Fogyasztói jelzáloghitel: mindhárom szakaszban 100%
+        return (kikialtas_ar, kikialtas_ar, kikialtas_ar)
+
+    # Általános MBVK meghirdetési logika: 90% / 70% / 50%
+    stage1 = int(kikialtas_ar * 0.90)
+    stage2 = int(kikialtas_ar * 0.70)
+    stage3 = int(kikialtas_ar * 0.50)
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
-    """Formázza a szakasz árakat: '1 000 000 Ft / 666 666 Ft / 500 000 Ft'"""
+    """
+    Formázza a szakasz árakat.
+    Ha mindhárom egyforma (pl. fogyasztói jelzáloghitel eset), tömören mutatjuk.
+    """
+    if prices[0] == prices[1] == prices[2]:
+        return f"{prices[0]:,} Ft (minden szakaszban)".replace(",", " ")
     return f"{prices[0]:,} Ft / {prices[1]:,} Ft / {prices[2]:,} Ft".replace(",", " ")
 
 def calculate_phase_ft_per_m2(phase_prices: Tuple[int, int, int], ref_area: Optional[float]) -> Optional[Tuple[int, int, int]]:
@@ -485,7 +514,6 @@ def extract(data: Dict) -> Dict:
     kikialtas_ar      = parse_price(g("putUpPrice", "startPrice", "kikialtasiAr"))
     minimum_ar        = parse_price(g("minPrice", "minimumAr", "minimumBid"))
     legmagasabb_licit = parse_price(g("currentBid", "highestBid", "legmagasabbLicit"))
-    price = next((v for v in (legmagasabb_licit, minimum_ar, kikialtas_ar) if v is not None and v > 0), None)
 
     licit_szam = g("bidCount", "licitekSzama")
     try:
@@ -496,12 +524,34 @@ def extract(data: Dict) -> Dict:
     leiras_full = g("description", "leiras", "propertyDescription") or ""
     leiras = leiras_full[:200].rstrip() if leiras_full else ""
 
-    # --- ÚJ RÉSZ: Lakottság vizsgálata a leírás alapján ---
+    # Lakottság és ártípus detektálása a leírás alapján (price kiszámítása előtt!)
     leiras_full_lower = leiras_full.lower()
-    is_lakott = False
-    if "lakottan" in leiras_full_lower or "haszonélvezet" in leiras_full_lower:
-        is_lakott = True
-    # ------------------------------------------------------
+    is_lakott = "lakottan" in leiras_full_lower or "haszonélvezet" in leiras_full_lower
+
+    # Ártípus meghatározása (Vht. 173/A-B. §):
+    #   "jelzalog"    – fogyasztói jelzáloghitelből eredő tartozás → 100% minden szakaszban
+    #   "lakoingatan" – lakóingatlan + adós egyetlen lakóhelye     → 70% minden szakaszban
+    #   "altalanos"   – minden más eset                            → 50% minden szakaszban
+    jelzalog_kws  = ["fogyasztói jelzáloghitel", "jelzáloghitel", "jelzálog"]
+    lakoingatan_kws = ["lakóingatlan", "lakóház", "lakás"]
+    if any(kw in leiras_full_lower for kw in jelzalog_kws):
+        ar_tipus = "jelzalog"
+    elif any(kw in leiras_full_lower for kw in lakoingatan_kws):
+        ar_tipus = "lakoingatan"
+    else:
+        ar_tipus = "altalanos"
+
+    # Jelenlegi ár (= az aktuális 1. szakasz meghirdetett ára):
+    # Ha van licit → legmagasabb_licit; ha nincs → 1. szakasz ár.
+    # minimum_ar az API-ban árverési előleg/licitküszöb – NEM vételár, kihagyjuk.
+    # Jelzálog esetén a kikiáltási ár 100%, egyébként az MBVK 90%-on hirdeti az 1. szakaszt.
+    stage1_ratio = 1.00 if ar_tipus == "jelzalog" else 0.90
+    if legmagasabb_licit and legmagasabb_licit > 0:
+        price = legmagasabb_licit
+    elif kikialtas_ar and kikialtas_ar > 0:
+        price = int(kikialtas_ar * stage1_ratio)
+    else:
+        price = None
 
     telek_api   = parse_area(g("landArea",  "totalArea", "telekmeret", "terulet"))
     epulet_api  = parse_area(g("builtArea", "area",      "alapterulet", "livingArea"))
@@ -535,8 +585,9 @@ def extract(data: Dict) -> Dict:
         "telepules":          telepules,
         "cim":                cim,
         "tulajdoni_hanyad":   hanyad,
-        "is_lakott":          is_lakott,                                 # <-- Új sor
-        "bekoltozheto":       "nem (lakott)" if is_lakott else "igen",   # <-- Dinamikus sor
+        "is_lakott":          is_lakott,
+        "ar_tipus":           ar_tipus,
+        "bekoltozheto":       "nem (lakott)" if is_lakott else "igen",
         "price":              price,
         "kikialtas_ar":       kikialtas_ar,
         "minimum_ar":         minimum_ar,
@@ -647,7 +698,7 @@ def send_telegram(data: Dict, indok: str = "új"):
     )
 
     # Szakasz árak és szakaszonkénti ft/m²
-    phase_prices = calculate_phase_prices(data.get("kikialtas_ar"), is_lakott=data.get("is_lakott", False))
+    phase_prices = calculate_phase_prices(data.get("kikialtas_ar"), ar_tipus=data.get("ar_tipus", "altalanos"))
     phase_prices_str = format_phase_prices(phase_prices) if phase_prices else None
     phase_ft_per_m2 = calculate_phase_ft_per_m2(phase_prices, ref_area) if phase_prices and ref_area else None
     phase_ft_per_m2_str = format_phase_ft_per_m2(phase_ft_per_m2) if phase_ft_per_m2 else None
