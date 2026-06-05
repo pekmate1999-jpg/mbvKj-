@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v6.01 – Beköltözhető ingatlanok (moveln=true)
+MBVK Árverési Monitor v6.03 – Beköltözhető ingatlanok (moveln=true)
 Szűrés: tulajdoni hányad (1/1 vagy 1/2+1/2) és max ár 1M Ft
 
-Változások (v6.01):
-  - Megjelennek a szakaszok végdátumai (ha elérhetők)
-  - Megjelennek a szakaszonkénti minimális vételárak (1., 2., 3. szakasz)
-  - Egyéb fejlesztések az előző verzióból (markdown escape, dátumösszehasonlítás, stb.)
+Változások (v6.03):
+  - Szakaszonkénti Ft/m² megjelenítés (1./2./3. szakasz)
+  - A szakaszok vége (hátralévő napok) a státusz sor fölé került
+  - Törölve az egyedi Ft/m² érték (a jelenlegi árból számolt)
 """
 
 import csv
@@ -369,14 +369,9 @@ def generate_timeline(
 
     return f"{bar_str}\n*{final_stage}. szakasz{ratio_text}*"
 
-# ── Szakasz árak kiszámítása ─────────────────────────────────────────────────
+# ── Szakasz árak, ft/m² és hátralévő napok ───────────────────────────────────
 def calculate_phase_prices(kikialtas_ar: Optional[int]) -> Optional[Tuple[int, int, int]]:
-    """
-    Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban).
-    Szabály: 1. szakasz: kikiáltási ár
-             2. szakasz: kikiáltási ár * 2/3
-             3. szakasz: kikiáltási ár / 2
-    """
+    """Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban)."""
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
     stage1 = kikialtas_ar
@@ -385,16 +380,42 @@ def calculate_phase_prices(kikialtas_ar: Optional[int]) -> Optional[Tuple[int, i
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
-    """Formázza a szakasz árakat: '1,000,000 Ft / 666,666 Ft / 500,000 Ft'"""
+    """Formázza a szakasz árakat: '1 000 000 Ft / 666 666 Ft / 500 000 Ft'"""
     return f"{prices[0]:,} Ft / {prices[1]:,} Ft / {prices[2]:,} Ft".replace(",", " ")
 
-def format_phase_dates(phase_ends: Optional[List[str]]) -> Optional[str]:
-    """Formázza a szakasz végdátumokat: '2025-06-10, 2025-06-17, 2025-06-24'"""
-    if not phase_ends or len(phase_ends) < 2:
+def calculate_phase_ft_per_m2(phase_prices: Tuple[int, int, int], ref_area: Optional[float]) -> Optional[Tuple[int, int, int]]:
+    """Kiszámolja a szakaszonkénti Ft/m² értékeket (kerekítve)."""
+    if not ref_area or ref_area <= 0:
         return None
-    # Csak a dátum rész kell (YYYY-MM-DD)
-    dates = [end.split("T")[0] for end in phase_ends if end]
-    return ", ".join(dates)
+    return (
+        int(phase_prices[0] / ref_area),
+        int(phase_prices[1] / ref_area),
+        int(phase_prices[2] / ref_area)
+    )
+
+def format_phase_ft_per_m2(ft_per_m2: Tuple[int, int, int]) -> str:
+    """Formázza a szakaszonkénti Ft/m² értékeket: '234 Ft/m² / 156 Ft/m² / 117 Ft/m²'"""
+    return f"{ft_per_m2[0]:,} Ft/m² / {ft_per_m2[1]:,} Ft/m² / {ft_per_m2[2]:,} Ft/m²".replace(",", " ")
+
+def format_phase_remaining_days(phase_ends: Optional[List[str]]) -> Optional[str]:
+    """
+    A szakaszok végdátumaiból kiszámolja a hátralévő napokat.
+    Visszaad egy stringet: "5 nap, 15 nap, 25 nap" vagy None.
+    """
+    if not phase_ends:
+        return None
+    now = datetime.now()
+    days_list = []
+    for end_str in phase_ends:
+        end_dt = _parse_dt(end_str)
+        if end_dt is None:
+            return None
+        delta = (end_dt - now).days
+        if delta < 0:
+            days_list.append("lejárt")
+        else:
+            days_list.append(f"{delta} nap")
+    return ", ".join(days_list)
 
 # ── Adatbázis (SQLite) ────────────────────────────────────────────────────────
 def init_db() -> sqlite3.Connection:
@@ -495,13 +516,13 @@ def extract(data: Dict) -> Dict:
     telek_meret  = telek_api  or telek_leiras
     epulet_meret = epulet_api or epulet_leiras
 
+    # Referencia terület: telek > épület > None
     if telek_meret is not None and telek_meret > 0:
         ref_area = telek_meret
     elif epulet_meret is not None and epulet_meret > 0:
         ref_area = epulet_meret
     else:
         ref_area = None
-    ft_per_m2 = int(price / ref_area) if price and ref_area and ref_area > 0 else None
 
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
     arveres_kezdete = g("auctionStartDate", "startDate", "auctionStart", "kezdet", "kibocsatasDatuma")
@@ -521,7 +542,7 @@ def extract(data: Dict) -> Dict:
         "telek_forras":       "api" if telek_api else ("leiras" if telek_leiras else None),
         "epulet_meret":       epulet_meret,
         "epulet_forras":      "api" if epulet_api else ("leiras" if epulet_leiras else None),
-        "ft_per_m2":          ft_per_m2,
+        "ref_area":           ref_area,
         "arveres_kezdete":    arveres_kezdete or "N/A",
         "arveres_vege":       arveres_vege or "N/A",
         "leiras":             leiras,
@@ -587,7 +608,7 @@ def send_telegram(data: Dict, indok: str = "új"):
     telek_f   = data.get("telek_forras")
     epulet_m  = data.get("epulet_meret")
     epulet_f  = data.get("epulet_forras")
-    ft_m2     = data.get("ft_per_m2")
+    ref_area  = data.get("ref_area")
 
     dist_km = bp_distance_km(telepules, data.get("cim"))
     maps_url = google_maps_url(data.get("cim"))
@@ -605,7 +626,7 @@ def send_telegram(data: Dict, indok: str = "új"):
     licit_str  = str(licit_n)                           if licit_n > 0 else None
     telek_str  = fmt_area(telek_m, telek_f)
     epulet_str = fmt_area(epulet_m, epulet_f)
-    ft_m2_str  = f"{ft_m2:,} Ft/m²".replace(",", " ") if ft_m2    else None
+
     def fmt_date(s: Optional[str]) -> Optional[str]:
         if not s or s == "N/A":
             return None
@@ -621,10 +642,12 @@ def send_telegram(data: Dict, indok: str = "új"):
         data.get("phase_end_dates") or None,
     )
 
-    # ── ÚJ: szakasz árak és végdátumok ───────────────────────────────────────
+    # Szakasz árak és szakaszonkénti ft/m²
     phase_prices = calculate_phase_prices(data.get("kikialtas_ar"))
     phase_prices_str = format_phase_prices(phase_prices) if phase_prices else None
-    phase_dates_str = format_phase_dates(data.get("phase_end_dates"))
+    phase_ft_per_m2 = calculate_phase_ft_per_m2(phase_prices, ref_area) if phase_prices and ref_area else None
+    phase_ft_per_m2_str = format_phase_ft_per_m2(phase_ft_per_m2) if phase_ft_per_m2 else None
+    phase_remaining = format_phase_remaining_days(data.get("phase_end_dates"))
 
     INDOK_EMOJI = {
         "új":        "🆕",
@@ -644,27 +667,29 @@ def send_telegram(data: Dict, indok: str = "új"):
     if legh_str:
         lines.append(f"📈 *Legmagasabb licit:* {legh_str}")
 
-    # Szakasz árak kiírása (ha van)
     if phase_prices_str:
         lines.append(f"💰 *Szakasz árak (1./2./3.):* {phase_prices_str}")
+
+    # Szakaszonkénti Ft/m² (ha van referencia terület)
+    if phase_ft_per_m2_str:
+        lines.append(f"💹 *Ft/m² (1./2./3.):* {phase_ft_per_m2_str}")
 
     if telek_str:
         lines.append(f"🏕 *Telekméret:* {telek_str}")
     if epulet_str:
         lines.append(f"🏠 *Épület alapterülete:* {epulet_str}")
-    if ft_m2_str:
-        lines.append(f"💹 *Ft/m²:* {ft_m2_str}")
     lines.append("🚪 *Beköltözhető:* igen")
     if hanyad:
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad}")
     if licit_str:
         lines.append(f"🔄 *Licitek száma:* {licit_str}")
 
-    # Szakaszok végdátumai (ha van)
-    if phase_dates_str:
-        lines.append(f"📅 *Szakaszok vége:* {phase_dates_str}")
+    # Szakaszok vége (hátralévő napok) a státusz fölé
+    if phase_remaining:
+        lines.append(f"⏳ *Szakaszok vége:* {phase_remaining}")
+
     if end_str:
-        lines.append(f"⏳ *Árverés vége:* {end_str}")
+        lines.append(f"📅 *Árverés vége:* {end_str}")
 
     lines.append(f"📊 *Státusz:* {timeline}")
 
@@ -699,7 +724,7 @@ def send_telegram(data: Dict, indok: str = "új"):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor v6.01 indítás – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor v6.03 indítás – %s", datetime.now().isoformat())
     if not GEOPY_OK:
         log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
