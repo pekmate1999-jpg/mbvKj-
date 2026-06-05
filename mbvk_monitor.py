@@ -365,14 +365,16 @@ def generate_timeline(
 
     return f"{bar_str}\n*{final_stage}. szakasz{ratio_text}*"
 
-# ── Szakasz árak, ft/m² és hátralévő napok ───────────────────────────────────
-def calculate_phase_prices(kikialtas_ar: Optional[int]) -> Optional[Tuple[int, int, int]]:
-    """Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban)."""
+def calculate_phase_prices(kikialtas_ar: Optional[int], is_lakott: bool = False) -> Optional[Tuple[int, int, int]]:
+    """Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban), figyelembe véve a lakottságot."""
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
-    stage1 = kikialtas_ar
-    stage2 = int(kikialtas_ar * 2 / 3) # <-- ITT VAN A HIBA
-    stage3 = int(kikialtas_ar / 2)
+    
+    # 1. szakasz: Lakottan 90%, beköltözhetően 100%
+    stage1 = int(kikialtas_ar * 0.9) if is_lakott else kikialtas_ar
+    stage2 = int(kikialtas_ar * 0.7)
+    stage3 = int(kikialtas_ar * 0.5)
+    
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
@@ -493,8 +495,15 @@ def extract(data: Dict) -> Dict:
     except (ValueError, TypeError):
         licit_szam = 0
 
-    leiras_full = g("description", "leiras", "propertyDescription") or ""
+leiras_full = g("description", "leiras", "propertyDescription") or ""
     leiras = leiras_full[:200].rstrip() if leiras_full else ""
+
+    # --- ÚJ RÉSZ: Lakottság vizsgálata a leírás alapján ---
+    leiras_full_lower = leiras_full.lower()
+    is_lakott = False
+    if "lakottan" in leiras_full_lower or "haszonélvezet" in leiras_full_lower:
+        is_lakott = True
+    # ------------------------------------------------------
 
     telek_api   = parse_area(g("landArea",  "totalArea", "telekmeret", "terulet"))
     epulet_api  = parse_area(g("builtArea", "area",      "alapterulet", "livingArea"))
@@ -523,13 +532,15 @@ def extract(data: Dict) -> Dict:
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
     arveres_kezdete = g("auctionStartDate", "startDate", "auctionStart", "kezdet", "kibocsatasDatuma")
 
-    return {
+   return {
         "megye":              megye,
         "telepules":          telepules,
         "cim":                cim,
         "tulajdoni_hanyad":   hanyad,
-        "bekoltözhető":       "igen",
+        "is_lakott":          is_lakott,                                 # <-- Új sor
+        "bekoltozheto":       "nem (lakott)" if is_lakott else "igen",   # <-- Dinamikus sor
         "price":              price,
+        # ... a többi marad változatlan ...
         "kikialtas_ar":       kikialtas_ar,
         "minimum_ar":         minimum_ar,
         "legmagasabb_licit":  legmagasabb_licit,
