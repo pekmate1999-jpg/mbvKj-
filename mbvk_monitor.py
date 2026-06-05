@@ -247,7 +247,7 @@ def _parse_dt(s: str) -> Optional[datetime]:
             continue
     return None
 
-def estimate_phase_ends(
+def calculate_phase_ends(
     arveres_kezdete: str,
     arveres_vege: str,
     licit_szam: int = 0,
@@ -255,60 +255,53 @@ def estimate_phase_ends(
     kikialtas_ar: Optional[int] = None,
 ) -> List[str]:
     """
-    MBVK szakasz-határok becslése az API adatokból (Vht. 145/B. §).
-    A szakaszok mindig egyenlő hosszúak.
+    MBVK szakasz-határok pontos kiszámítása (Vht. 145/B. §).
+
+    Az MBVK API az auctionEndDate mezőben MINDIG a teljes árverés végét adja,
+    a startDate mezőben MINDIG a teljes árverés kezdetét. A három szakasz
+    egyenlő hosszú, pontosan harmadolva a teljes időtartamot.
+
+    Ha a licitek száma eléri a minimum árat (azaz minimum_ar >= kikialtas_ar),
+    az árverés az aktuális szakasz végén lezárul – ilyenkor csak 1 dátumot adunk.
     """
     import datetime as _dt2
-    start_dt   = _parse_dt(arveres_kezdete)
-    api_end_dt = _parse_dt(arveres_vege)
-    if not start_dt or not api_end_dt:
+
+    start_dt = _parse_dt(arveres_kezdete)
+    end_dt   = _parse_dt(arveres_vege)
+
+    if not start_dt or not end_dt:
         return []
 
-    total_days = (api_end_dt - start_dt).days
-    time_part  = arveres_vege.split("T")[1] if "T" in arveres_vege else "12:00:00"
+    total_sec = (end_dt - start_dt).total_seconds()
+    if total_sec <= 0:
+        return []
 
-    def fmt(dt) -> str:
+    # Az időpont-rész megőrzése (pl. "15:00:00")
+    time_part = "15:00:00"
+    if arveres_vege and "T" in arveres_vege:
+        time_part = arveres_vege.split("T")[1]
+    elif arveres_vege and " " in arveres_vege:
+        time_part = arveres_vege.split(" ")[1]
+
+    def fmt(dt: "datetime") -> str:
         return f"{dt.strftime('%Y-%m-%d')}T{time_part}"
 
-    # minimum ár elérve -> lezárult
+    # Egyenlő szakaszhosszak: teljes időtartam / 3
+    phase_sec = total_sec / 3
+    phase1_end = start_dt + _dt2.timedelta(seconds=phase_sec)
+    phase2_end = start_dt + _dt2.timedelta(seconds=phase_sec * 2)
+    phase3_end = end_dt  # pontosan az API-tól kapott vége
+
+    # Ha az árverés már lezárult (minimum ár teljesítve), csak a tényleges záró dátumot adjuk
     if licit_szam and minimum_ar and kikialtas_ar and minimum_ar >= kikialtas_ar:
-        return [fmt(api_end_dt)]
+        log.debug("Árverés lezárult (min_ar >= kiki_ar): csak 1 dátum")
+        return [fmt(phase3_end)]
 
-    # nincs licit -> API a 3. szakasz végét adja
-    if licit_szam == 0:
-        if total_days >= 45:
-            sd = round(total_days / 3)
-            return [
-                fmt(start_dt + _dt2.timedelta(days=sd)),
-                fmt(start_dt + _dt2.timedelta(days=sd * 2)),
-                fmt(api_end_dt),
-            ]
-        return []
+    return [fmt(phase1_end), fmt(phase2_end), fmt(phase3_end)]
 
-    # van licit -> API az aktuális szakasz végét adja
-    if 5 <= total_days <= 30:           # 1. szakasz vége
-        sd = total_days
-        return [
-            fmt(api_end_dt),
-            fmt(api_end_dt + _dt2.timedelta(days=sd)),
-            fmt(api_end_dt + _dt2.timedelta(days=sd * 2)),
-        ]
-    elif 30 < total_days <= 50:         # 2. szakasz vége
-        sd = total_days // 2
-        return [
-            fmt(start_dt + _dt2.timedelta(days=sd)),
-            fmt(api_end_dt),
-            fmt(api_end_dt + _dt2.timedelta(days=sd)),
-        ]
-    elif 50 < total_days <= 75:         # 3. szakasz vége
-        sd = total_days // 3
-        return [
-            fmt(start_dt + _dt2.timedelta(days=sd)),
-            fmt(start_dt + _dt2.timedelta(days=sd * 2)),
-            fmt(api_end_dt),
-        ]
 
-    return []
+# Visszafelé kompatibilitás: régi név is működjön
+estimate_phase_ends = calculate_phase_ends
 
 def generate_timeline(
     kezdete: str,
@@ -320,18 +313,27 @@ def generate_timeline(
     """
     Vizuális haladás-sáv + szakasz info a Telegram üzenethez.
     Kompakt, 9-karakteres verzió a sortörések elkerülésére.
+
+    A haladás-sáv a TELJES árverés (kezdete→utolsó szakasz vége) alapján számít.
+    Az aktuális szakasz meghatározása a phase_ends listából történik.
     """
     import datetime as _dt
 
     now_dt = _dt.datetime.now()
 
     start_dt = _parse_dt(kezdete)
-    end_dt   = _parse_dt(vege)
 
-    if not start_dt or not end_dt:
+    # A progress-sávhoz a teljes árverés végét (= utolsó szakasz vége) használjuk
+    if phase_ends:
+        parsed_ends = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
+        total_end_dt = parsed_ends[-1] if parsed_ends else _parse_dt(vege)
+    else:
+        total_end_dt = _parse_dt(vege)
+
+    if not start_dt or not total_end_dt:
         return "`[░░░|░░░|░░░]`\n_Ismeretlen időszak_"
 
-    total_sec = (end_dt - start_dt).total_seconds()
+    total_sec = (total_end_dt - start_dt).total_seconds()
     if total_sec <= 0:
         return "`[███|███|███]`\n_Lezárult_"
 
@@ -342,28 +344,28 @@ def generate_timeline(
     blocks = ["█" if i < filled else "░" for i in range(9)]
     bar_str = f"`[{''.join(blocks[0:3])}|{''.join(blocks[3:6])}|{''.join(blocks[6:9])}]` {int(progress * 100)}%"
 
-    final_stage = 1
+    # Aktuális szakasz: az első olyan szakasz, amelynek vége még nem múlt el
     if phase_ends:
-        parsed_ends = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
-        for idx, ph_end in enumerate(parsed_ends, start=1):
+        parsed_ends_sorted = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
+        current_stage = len(parsed_ends_sorted)  # alapértelmezett: utolsó (lezárult esetén)
+        for idx, ph_end in enumerate(parsed_ends_sorted, start=1):
             if now_dt <= ph_end:
-                final_stage = idx
+                current_stage = idx
                 break
-        else:
-            final_stage = len(parsed_ends)
     else:
+        # phase_ends nélkül: időarány alapján
         if progress < 0.333:
-            final_stage = 1
+            current_stage = 1
         elif progress < 0.666:
-            final_stage = 2
+            current_stage = 2
         else:
-            final_stage = 3
+            current_stage = 3
 
     ratio_text = ""
     if kiki_ar and min_ar and kiki_ar > 0:
         ratio_text = f" ({int(min_ar / kiki_ar * 100)}%)"
 
-    return f"{bar_str}\n*{final_stage}. szakasz{ratio_text}*"
+    return f"{bar_str}\n*{current_stage}. szakasz{ratio_text}*"
 
 def calculate_phase_prices(kikialtas_ar: Optional[int], is_lakott: bool = False) -> Optional[Tuple[int, int, int]]:
     """Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban), figyelembe véve a lakottságot."""
@@ -786,8 +788,8 @@ def run():
         data["auction_id"] = auction_id
         data["url"] = url
 
-        # Szakasz-határok becslése
-        phase_ends = estimate_phase_ends(
+        # Szakasz-határok pontos kiszámítása (Vht. 145/B. §)
+        phase_ends = calculate_phase_ends(
             data.get("arveres_kezdete", ""),
             data.get("arveres_vege", ""),
             licit_szam   = data.get("licitek_szama", 0),
@@ -796,7 +798,9 @@ def run():
         )
         if phase_ends:
             data["phase_end_dates"] = phase_ends
-            data["arveres_vege"]    = phase_ends[-1]   # valódi teljes vége
+            # arveres_vege = a teljes árverés vége = utolsó szakasz vége
+            # (az API-tól kapott érték már ezt jelenti, de felülírjuk a kiszámított értékkel)
+            data["arveres_vege"] = phase_ends[-1]
         else:
             data["phase_end_dates"] = []
 
