@@ -23,6 +23,7 @@ from urllib.parse import quote_plus
 
 import requests
 
+
 # geopy opcionális – ha nincs telepítve, a távolság-funkció ki van kalkulálva
 try:
     from geopy.geocoders import Nominatim
@@ -258,6 +259,7 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
     except Exception as exc:
         log.warning("Részlet API hiba (%s/%s): %s", exec_id, auction_id, exc)
         return None
+
 def _parse_dt(s: str) -> Optional["datetime.datetime"]:
     """ISO/pont formátumú dátumstring -> datetime, vagy None."""
     import datetime as _dt
@@ -270,6 +272,77 @@ def _parse_dt(s: str) -> Optional["datetime.datetime"]:
         except ValueError:
             continue
     return None
+
+
+def estimate_phase_ends(
+    arveres_kezdete: str,
+    arveres_vege: str,
+    licit_szam: int = 0,
+    minimum_ar: Optional[int] = None,
+    kikialtas_ar: Optional[int] = None,
+) -> List[str]:
+    """
+    MBVK szakasz-határok becslése az API adatokból (Vht. 145/B. §).
+    A szakaszok mindig egyenlő hosszúak.
+
+    Az API endDate viselkedése:
+      - Nincs licit (licit_szam==0)  → 3. szakasz végét adja → visszaosztjuk harmadra
+      - Van licit, total_days 5-30   → 1. szakasz vége → előre számolunk ×3
+      - Van licit, total_days 30-50  → 2. szakasz vége → visszaszámolunk /2, majd ×3
+      - Van licit, total_days 50-75  → 3. szakasz vége → visszaszámolunk /3
+      - Min ár elérve (lezárult)     → csak 1 végdátum, az a tényleges vége
+    """
+    import datetime as _dt2
+    start_dt   = _parse_dt(arveres_kezdete)
+    api_end_dt = _parse_dt(arveres_vege)
+    if not start_dt or not api_end_dt:
+        return []
+
+    total_days = (api_end_dt - start_dt).days
+    time_part  = arveres_vege.split("T")[1] if "T" in arveres_vege else "12:00:00"
+
+    def fmt(dt) -> str:
+        return f"{dt.strftime('%Y-%m-%d')}T{time_part}"
+
+    # C: minimum ár elérve → lezárult az aktuális szakasszal
+    if licit_szam and minimum_ar and kikialtas_ar and minimum_ar >= kikialtas_ar:
+        return [fmt(api_end_dt)]
+
+    # A: nincs licit → API a 3. szakasz végét adja
+    if licit_szam == 0:
+        if total_days >= 45:
+            sd = round(total_days / 3)
+            return [
+                fmt(start_dt + _dt2.timedelta(days=sd)),
+                fmt(start_dt + _dt2.timedelta(days=sd * 2)),
+                fmt(api_end_dt),
+            ]
+        return []  # rövid + nincs licit → ismeretlen
+
+    # B: van licit → API az aktuális szakasz végét adja; total_days alapján meghatározzuk melyiket
+    if 5 <= total_days <= 30:           # 1. szakasz vége
+        sd = total_days
+        return [
+            fmt(api_end_dt),
+            fmt(api_end_dt + _dt2.timedelta(days=sd)),
+            fmt(api_end_dt + _dt2.timedelta(days=sd * 2)),
+        ]
+    elif 30 < total_days <= 50:         # 2. szakasz vége
+        sd = total_days // 2
+        return [
+            fmt(start_dt + _dt2.timedelta(days=sd)),
+            fmt(api_end_dt),
+            fmt(api_end_dt + _dt2.timedelta(days=sd)),
+        ]
+    elif 50 < total_days <= 75:         # 3. szakasz vége (licit a végén)
+        sd = total_days // 3
+        return [
+            fmt(start_dt + _dt2.timedelta(days=sd)),
+            fmt(start_dt + _dt2.timedelta(days=sd * 2)),
+            fmt(api_end_dt),
+        ]
+
+    return []
 
 
 def generate_timeline(
@@ -418,50 +491,9 @@ def extract(data: Dict) -> Dict:
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
     arveres_kezdete = g("auctionStartDate", "startDate", "auctionStart", "kezdet", "kibocsatasDatuma")
 
-    # ── Teljes árverési időszak vége a phases tömbből ────────────────────────
-    # Az API sokszor csak az aktuális szakasz végét adja endDate-ben.
-    # A phases/sections tömbből kiszedjük az összes szakasz közül a legkésőbbit,
-    # hogy a progress-sáv a TELJES árverési időszakhoz képest mutasson haladást.
-    phases_total_end: Optional[str] = None
-    for phases_key in ("phases", "auctionPhases", "sections", "stages"):
-        phases = data.get(phases_key)
-        if isinstance(phases, list) and phases:
-            candidates = []
-            for ph in phases:
-                if not isinstance(ph, dict):
-                    continue
-                for ek in ("endDate", "auctionEndDate", "end", "befejezoDatum", "toDate"):
-                    v = ph.get(ek)
-                    if v:
-                        candidates.append(str(v))
-                        break
-            if candidates:
-                phases_total_end = max(candidates)   # lexikografikus max = legkésőbbi ISO dátum
-                break
-
-    # Ha sikerült phases-ből kinyerni és az később van, mint az eddig ismert vége → felülírjuk
-    if phases_total_end:
-        if not arveres_vege or arveres_vege == "N/A" or phases_total_end > arveres_vege:
-            arveres_vege = phases_total_end
-            log.debug("Árverés vége felülírva phases alapján: %s", arveres_vege)
-
-    # ── Fázis-végdátumok rendezett listája (generate_timeline-nak) ───────────
-    # Ugyanazokat a kulcsokat nézzük, csak most az összes fázis végét gyűjtjük össze.
-    phase_end_dates: List[str] = []
-    for phases_key in ("phases", "auctionPhases", "sections", "stages"):
-        phases = data.get(phases_key)
-        if isinstance(phases, list) and phases:
-            for ph in phases:
-                if not isinstance(ph, dict):
-                    continue
-                for ek in ("endDate", "auctionEndDate", "end", "befejezoDatum", "toDate"):
-                    v = ph.get(ek)
-                    if v:
-                        phase_end_dates.append(str(v))
-                        break
-            if phase_end_dates:
-                phase_end_dates.sort()   # időrendbe rendezve
-                break
+    # Megjegyzés: az API nem adja vissza a szakasz-táblázatot.
+    # A phase_end_dates-t az estimate_phase_ends() tölti fel a run()-ban,
+    # és kívülről kerül a data dict-be. Az extract() ezt nem kezeli.
 
     return {
         "megye":              megye,
@@ -481,7 +513,6 @@ def extract(data: Dict) -> Dict:
         "ft_per_m2":          ft_per_m2,
         "arveres_kezdete":    arveres_kezdete or "N/A",
         "arveres_vege":       arveres_vege or "N/A",
-        "phase_end_dates":    phase_end_dates,          # ← ÚJ: tényleges szakaszhatárok
         "leiras":             leiras,
         "url":                data.get("url", ""),
     }
@@ -683,6 +714,20 @@ def run():
         data = extract(detail)
         data["auction_id"] = auction_id
         data["url"] = url
+
+        # Szakasz-határok becslése az 1. szakasz végéből (Vht. 145/B. § – egyenlő hossz)
+        phase_ends = estimate_phase_ends(
+            data.get("arveres_kezdete", ""),
+            data.get("arveres_vege", ""),
+            licit_szam   = data.get("licitek_szama", 0),
+            minimum_ar   = data.get("minimum_ar"),
+            kikialtas_ar = data.get("kikialtas_ar"),
+        )
+        if phase_ends:
+            data["phase_end_dates"] = phase_ends
+            data["arveres_vege"]    = phase_ends[-1]   # valódi teljes vége
+        else:
+            data["phase_end_dates"] = []
 
         log.info(
             "Feldolgozva: %s | %s | hányad=%s | ár=%s | telek=%s | épület=%s | licit_sz=%s",
