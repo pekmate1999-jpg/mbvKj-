@@ -258,51 +258,88 @@ def api_detail(session: requests.Session, exec_id, auction_id) -> Optional[Dict]
     except Exception as exc:
         log.warning("Részlet API hiba (%s/%s): %s", exec_id, auction_id, exc)
         return None
-def generate_timeline(kezdete: str, vege: str, kiki_ar: Optional[int], min_ar: Optional[int]) -> str:
-    import datetime
-    
-    try:
-        s_str = kezdete.split("T")[0].split()[0].replace(".", "-").strip("-")
-        e_str = vege.split("T")[0].split()[0].replace(".", "-").strip("-")
-        start_dt = datetime.datetime.strptime(s_str, "%Y-%m-%d")
-        end_dt = datetime.datetime.strptime(e_str, "%Y-%m-%d")
-        now_dt = datetime.datetime.now()
-    except Exception:
+def _parse_dt(s: str) -> Optional["datetime.datetime"]:
+    """ISO/pont formátumú dátumstring -> datetime, vagy None."""
+    import datetime as _dt
+    if not s or s == "N/A":
+        return None
+    s2 = s.split("T")[0].split()[0].replace(".", "-").strip("-")
+    for fmt in ("%Y-%m-%d", "%Y-%m"):
+        try:
+            return _dt.datetime.strptime(s2, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def generate_timeline(
+    kezdete: str,
+    vege: str,
+    kiki_ar: Optional[int],
+    min_ar: Optional[int],
+    phase_ends: Optional[List[str]] = None,   # ← ÚJ: opcionális szakasz-határok listája
+) -> str:
+    """
+    Vizuális haladás-sáv + szakasz info a Telegram üzenethez.
+
+    A szakasz meghatározásának prioritása:
+      1. Ha phase_ends át van adva (az API tényleges fázis-végdátumai), ezeket
+         használjuk a szakaszhatárokhoz. Az aktuális dátum alapján meghatározzuk
+         melyik fázisban vagyunk.
+      2. Ha nincs phase_ends, az időarány alapján egyenlő harmadokra osztjuk
+         a teljes árverési időszakot (régi viselkedés – fallback).
+    """
+    import datetime as _dt
+
+    now_dt = _dt.datetime.now()
+
+    start_dt = _parse_dt(kezdete)
+    end_dt   = _parse_dt(vege)
+
+    if not start_dt or not end_dt:
         return "`[░░░░░|░░░░░|░░░░░]`\n_Ismeretlen időszak_"
-    
+
     total_sec = (end_dt - start_dt).total_seconds()
     if total_sec <= 0:
         return "`[█████|█████|█████]`\n_Lezárult_"
-    
-    elapsed = (now_dt - start_dt).total_seconds()
+
+    elapsed  = (now_dt - start_dt).total_seconds()
     progress = max(0.0, min(1.0, elapsed / total_sec))
-    
-    # Vizuális sáv generálása
+
+    # ── Vizuális sáv ──────────────────────────────────────────────────────────
     filled = int(progress * 15)
     blocks = ["█" if i < filled else "░" for i in range(15)]
-    stage1 = "".join(blocks[0:5])
-    stage2 = "".join(blocks[5:10])
-    stage3 = "".join(blocks[10:15])
-    
-    # Szakasz meghatározása KIZÁRÓLAG idő alapján
-    if progress < 0.333:
-        final_stage = 1
-    elif progress < 0.666:
-        final_stage = 2
+    bar_str = f"`[{''.join(blocks[0:5])}|{''.join(blocks[5:10])}|{''.join(blocks[10:15])}]` {int(progress * 100)}%"
+
+    # ── Szakasz meghatározása ─────────────────────────────────────────────────
+    final_stage = 1   # alapértelmezett
+
+    if phase_ends:
+        # Tényleges fázis-végdátumok alapján: az első olyan fázis amelynek
+        # a vége még a jövőben van → abban a fázisban vagyunk.
+        parsed_ends = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
+        for idx, ph_end in enumerate(parsed_ends, start=1):
+            if now_dt <= ph_end:
+                final_stage = idx
+                break
+        else:
+            # Minden fázis lejárt – az utolsóban vagyunk
+            final_stage = len(parsed_ends)
     else:
-        final_stage = 3
-    
-    # Ár-arány csak megjelenítési info, NEM befolyásolja a szakaszt
+        # Fallback: egyenlő harmadok az idő alapján
+        if progress < 0.333:
+            final_stage = 1
+        elif progress < 0.666:
+            final_stage = 2
+        else:
+            final_stage = 3
+
+    # ── Ár-arány (csak megjelenítési info) ────────────────────────────────────
     ratio_text = ""
     if kiki_ar and min_ar and kiki_ar > 0:
-        ratio = min_ar / kiki_ar
-        ratio_text = f" ({int(ratio * 100)}%)"
-    
-    pct = int(progress * 100)
-    bar = f"`[{stage1}|{stage2}|{stage3}]` {pct}%"
-    status = f"*{final_stage}. szakasz{ratio_text}*"
-    
-    return f"{bar}\n{status}"
+        ratio_text = f" ({int(min_ar / kiki_ar * 100)}%)"
+
+    return f"{bar_str}\n*{final_stage}. szakasz{ratio_text}*"
 # ── Adatkinyerés ──────────────────────────────────────────────────────────────
 def extract(data: Dict) -> Dict:
     def g(*keys):
@@ -381,6 +418,51 @@ def extract(data: Dict) -> Dict:
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
     arveres_kezdete = g("auctionStartDate", "startDate", "auctionStart", "kezdet", "kibocsatasDatuma")
 
+    # ── Teljes árverési időszak vége a phases tömbből ────────────────────────
+    # Az API sokszor csak az aktuális szakasz végét adja endDate-ben.
+    # A phases/sections tömbből kiszedjük az összes szakasz közül a legkésőbbit,
+    # hogy a progress-sáv a TELJES árverési időszakhoz képest mutasson haladást.
+    phases_total_end: Optional[str] = None
+    for phases_key in ("phases", "auctionPhases", "sections", "stages"):
+        phases = data.get(phases_key)
+        if isinstance(phases, list) and phases:
+            candidates = []
+            for ph in phases:
+                if not isinstance(ph, dict):
+                    continue
+                for ek in ("endDate", "auctionEndDate", "end", "befejezoDatum", "toDate"):
+                    v = ph.get(ek)
+                    if v:
+                        candidates.append(str(v))
+                        break
+            if candidates:
+                phases_total_end = max(candidates)   # lexikografikus max = legkésőbbi ISO dátum
+                break
+
+    # Ha sikerült phases-ből kinyerni és az később van, mint az eddig ismert vége → felülírjuk
+    if phases_total_end:
+        if not arveres_vege or arveres_vege == "N/A" or phases_total_end > arveres_vege:
+            arveres_vege = phases_total_end
+            log.debug("Árverés vége felülírva phases alapján: %s", arveres_vege)
+
+    # ── Fázis-végdátumok rendezett listája (generate_timeline-nak) ───────────
+    # Ugyanazokat a kulcsokat nézzük, csak most az összes fázis végét gyűjtjük össze.
+    phase_end_dates: List[str] = []
+    for phases_key in ("phases", "auctionPhases", "sections", "stages"):
+        phases = data.get(phases_key)
+        if isinstance(phases, list) and phases:
+            for ph in phases:
+                if not isinstance(ph, dict):
+                    continue
+                for ek in ("endDate", "auctionEndDate", "end", "befejezoDatum", "toDate"):
+                    v = ph.get(ek)
+                    if v:
+                        phase_end_dates.append(str(v))
+                        break
+            if phase_end_dates:
+                phase_end_dates.sort()   # időrendbe rendezve
+                break
+
     return {
         "megye":              megye,
         "telepules":          telepules,
@@ -399,6 +481,7 @@ def extract(data: Dict) -> Dict:
         "ft_per_m2":          ft_per_m2,
         "arveres_kezdete":    arveres_kezdete or "N/A",
         "arveres_vege":       arveres_vege or "N/A",
+        "phase_end_dates":    phase_end_dates,          # ← ÚJ: tényleges szakaszhatárok
         "leiras":             leiras,
         "url":                data.get("url", ""),
     }
@@ -496,7 +579,8 @@ def send_telegram(data: Dict):
         data.get("arveres_kezdete", ""),
         data.get("arveres_vege", ""),
         data.get("kikialtas_ar"),
-        data.get("minimum_ar")
+        data.get("minimum_ar"),
+        data.get("phase_end_dates") or None,   # ← ÚJ: tényleges szakaszhatárok
     )
 
     lines = ["🏠 *ÚJ MBVK TALÁLAT*", ""]
