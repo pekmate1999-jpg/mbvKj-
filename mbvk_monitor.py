@@ -97,7 +97,13 @@ def init_db() -> sqlite3.Connection:
     if "price" not in cols:
         conn.execute("ALTER TABLE properties ADD COLUMN price INTEGER")
         log.info("DB séma frissítve: price oszlop hozzáadva")
-        
+    if "licit_szam" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN licit_szam INTEGER")
+        log.info("DB séma frissítve: licit_szam oszlop hozzáadva")
+    if "arveres_vege" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN arveres_vege TEXT")
+        log.info("DB séma frissítve: arveres_vege oszlop hozzáadva")
+
     return conn
 
 # ── Segédfüggvények ───────────────────────────────────────────────────────────
@@ -563,7 +569,7 @@ def passes_filters(data: Dict) -> bool:
     return True
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-def send_telegram(data: Dict):
+def send_telegram(data: Dict, indok: str = "új"):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram nincs beállítva (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID hiányzik)")
         return
@@ -614,7 +620,14 @@ def send_telegram(data: Dict):
         data.get("phase_end_dates") or None,   # ← ÚJ: tényleges szakaszhatárok
     )
 
-    lines = ["🏠 *ÚJ MBVK TALÁLAT*", ""]
+    INDOK_EMOJI = {
+        "új":        "🆕",
+        "új licit":  "🔔",
+        "új dátum":  "📅",
+        "árcsökkenés": "📉",
+    }
+    emoji = INDOK_EMOJI.get(indok, "🏠")
+    lines = [f"{emoji} *MBVK TALÁLAT – {indok.upper()}*", ""]
 
     if cim and cim != "N/A":
         lines.append(f"📍 *Cím:* {cim}")
@@ -736,37 +749,60 @@ def run():
             data.get("licitek_szama"),
         )
 
-        # Csak a korábbi árat kérjük le az összehasonlításhoz
+        # Korábbi adatok lekérése az összehasonlításhoz
         existing = conn.execute(
-            "SELECT price FROM properties WHERE auction_id = ?",
+            "SELECT price, licit_szam, arveres_vege FROM properties WHERE auction_id = ?",
             (auction_id,)
         ).fetchone()
 
-        current_price = data.get("price")
+        current_price  = data.get("price")
+        current_licits = data.get("licitek_szama", 0)
+        current_vege   = data.get("arveres_vege", "")
 
         is_new = existing is None
-        
-        # VÁLTOZÁS: árcsökkenés figyelése (ha a korábbi ár nagyobb, mint a mostani)
-        price_decreased = not is_new and existing[0] is not None and current_price is not None and existing[0] > current_price
+
+        indok: Optional[str] = None
 
         if is_new:
+            indok = "új"
             conn.execute(
-                "INSERT INTO properties (auction_id, created_at, price) VALUES (?, ?, ?)",
-                (auction_id, datetime.utcnow().isoformat(), current_price)
+                """INSERT INTO properties (auction_id, created_at, price, licit_szam, arveres_vege)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (auction_id, datetime.utcnow().isoformat(),
+                 current_price, current_licits, current_vege)
             )
-        elif existing[0] != current_price:
-            # Az adatbázisban frissítjük az árat minden változáskor (emelkedésnél is), 
-            # de értesítést nem fog küldeni, csak ha csökkent.
-            conn.execute(
-                "UPDATE properties SET price = ? WHERE auction_id = ?",
-                (current_price, auction_id)
+        else:
+            prev_price, prev_licits, prev_vege = existing
+
+            price_decreased  = prev_price  is not None and current_price  is not None and current_price  < prev_price
+            licit_increased  = prev_licits is not None and current_licits is not None and current_licits > prev_licits
+            # "új dátum": a végdátum közelebb került (licit érkezett, szakasz lezárult)
+            date_moved_closer = (
+                prev_vege and current_vege and current_vege != "N/A" and prev_vege != "N/A"
+                and current_vege < prev_vege   # korábbi dátum = közelebb
             )
 
-        # VÁLTOZÁS: Csak akkor értesítünk, ha az ingatlan ÚJ, VAGY ha CSÖKKENT az ára
-        if passes_filters(data) and (is_new or price_decreased):
-            log.info("✅ Értesítés küldése: %s (új=%s, árcsökkenés=%s)",
-                     auction_id, is_new, price_decreased)
-            send_telegram(data)
+            if price_decreased:
+                indok = "árcsökkenés"
+            elif licit_increased and date_moved_closer:
+                indok = "új licit"
+            elif date_moved_closer:
+                indok = "új dátum"
+            elif licit_increased:
+                indok = "új licit"
+
+            # Adatbázis frissítése minden változáskor (értesítéstől függetlenül)
+            if price_decreased or licit_increased or date_moved_closer:
+                conn.execute(
+                    """UPDATE properties
+                       SET price = ?, licit_szam = ?, arveres_vege = ?
+                       WHERE auction_id = ?""",
+                    (current_price, current_licits, current_vege, auction_id)
+                )
+
+        if passes_filters(data) and indok:
+            log.info("✅ Értesítés küldése: %s (indok=%s)", auction_id, indok)
+            send_telegram(data, indok=indok)
             conn.execute(
                 "UPDATE properties SET notified_at = ? WHERE auction_id = ?",
                 (datetime.utcnow().isoformat(), auction_id)
@@ -775,7 +811,7 @@ def run():
             if is_new:
                 new_count += 1
         elif passes_filters(data):
-            log.info("⚠️ Nem új és az ár sem csökkent, nem küldünk értesítést: %s", auction_id)
+            log.info("⚠️ Nincs változás, nem küldünk értesítést: %s", auction_id)
         else:
             log.info("❌ Nem ment át (szűrő): %s", auction_id)
 
