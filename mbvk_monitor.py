@@ -495,7 +495,7 @@ def extract(data: Dict) -> Dict:
     except (ValueError, TypeError):
         licit_szam = 0
 
-leiras_full = g("description", "leiras", "propertyDescription") or ""
+    leiras_full = g("description", "leiras", "propertyDescription") or ""
     leiras = leiras_full[:200].rstrip() if leiras_full else ""
 
     # --- ÚJ RÉSZ: Lakottság vizsgálata a leírás alapján ---
