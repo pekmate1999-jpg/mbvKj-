@@ -4,9 +4,10 @@ MBVK Árverési Monitor v6.03 – Beköltözhető ingatlanok (moveln=true)
 Szűrés: tulajdoni hányad (1/1 vagy 1/2+1/2) és max ár 1M Ft
 
 Változások (v6.03):
-  - Szakaszonkénti Ft/m² megjelenítés (1./2./3. szakasz)
+  - Szakaszonkénti Ft/m² megjelenítés (1./2./3. szakasz) - optimalizált méret
   - A szakaszok vége (hátralévő napok) a státusz sor fölé került
   - Törölve az egyedi Ft/m² érték (a jelenlegi árból számolt)
+  - Telegram progress bar és Markdown escape javítások
 """
 
 import csv
@@ -95,12 +96,12 @@ def parse_area(val) -> Optional[float]:
 
 def escape_markdown(text: str) -> str:
     """
-    Escape special characters for Telegram Markdown (legacy) mode.
-    Characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    Specialis karakterek levédése Telegram legacy Markdown modhoz.
+    Hagyományos Markdown módban csak a *, _, [, és ` karaktereket kell védeni.
     """
     if not text:
         return ""
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    escape_chars = r"_*[`"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
@@ -324,6 +325,7 @@ def generate_timeline(
 ) -> str:
     """
     Vizuális haladás-sáv + szakasz info a Telegram üzenethez.
+    Kompakt, 9-karakteres verzió a sortörések elkerülésére.
     """
     import datetime as _dt
 
@@ -333,18 +335,18 @@ def generate_timeline(
     end_dt   = _parse_dt(vege)
 
     if not start_dt or not end_dt:
-        return "`[░░░░░|░░░░░|░░░░░]`\n_Ismeretlen időszak_"
+        return "`[░░░|░░░|░░░]`\n_Ismeretlen időszak_"
 
     total_sec = (end_dt - start_dt).total_seconds()
     if total_sec <= 0:
-        return "`[█████|█████|█████]`\n_Lezárult_"
+        return "`[███|███|███]`\n_Lezárult_"
 
     elapsed  = (now_dt - start_dt).total_seconds()
     progress = max(0.0, min(1.0, elapsed / total_sec))
 
-    filled = int(progress * 15)
-    blocks = ["█" if i < filled else "░" for i in range(15)]
-    bar_str = f"`[{''.join(blocks[0:5])}|{''.join(blocks[5:10])}|{''.join(blocks[10:15])}]` {int(progress * 100)}%"
+    filled = int(progress * 9)
+    blocks = ["█" if i < filled else "░" for i in range(9)]
+    bar_str = f"`[{''.join(blocks[0:3])}|{''.join(blocks[3:6])}|{''.join(blocks[6:9])}]` {int(progress * 100)}%"
 
     final_stage = 1
     if phase_ends:
@@ -394,8 +396,8 @@ def calculate_phase_ft_per_m2(phase_prices: Tuple[int, int, int], ref_area: Opti
     )
 
 def format_phase_ft_per_m2(ft_per_m2: Tuple[int, int, int]) -> str:
-    """Formázza a szakaszonkénti Ft/m² értékeket: '234 Ft/m² / 156 Ft/m² / 117 Ft/m²'"""
-    return f"{ft_per_m2[0]:,} Ft/m² / {ft_per_m2[1]:,} Ft/m² / {ft_per_m2[2]:,} Ft/m²".replace(",", " ")
+    """Formázza a szakaszonkénti Ft/m² értékeket kompaktabban: '260 / 173 / 130'"""
+    return f"{ft_per_m2[0]:,} / {ft_per_m2[1]:,} / {ft_per_m2[2]:,}".replace(",", " ")
 
 def format_phase_remaining_days(phase_ends: Optional[List[str]]) -> Optional[str]:
     """
@@ -670,9 +672,9 @@ def send_telegram(data: Dict, indok: str = "új"):
     if phase_prices_str:
         lines.append(f"💰 *Szakasz árak:* {phase_prices_str}")
 
-    # Szakaszonkénti Ft/m² (ha van referencia terület)
+    # Szakaszonkénti Ft/m² (kompakt forma ismétlések nélkül)
     if phase_ft_per_m2_str:
-        lines.append(f"💹 *Ft/m²:* {phase_ft_per_m2_str}")
+        lines.append(f"📈 *Ft/m²:* {phase_ft_per_m2_str}")
 
     if telek_str:
         lines.append(f"🏕 *Telekméret:* {telek_str}")
@@ -684,17 +686,13 @@ def send_telegram(data: Dict, indok: str = "új"):
     if licit_str:
         lines.append(f"🔄 *Licitek száma:* {licit_str}")
 
-    # Szakaszok vége (hátralévő napok) a státusz fölé
+    # Szakaszok vége és Árverés vége a státusz fölé csoportosítva (duplikáció kiszűrve)
     if phase_remaining:
         lines.append(f"⏳ *Szakaszok vége:* {phase_remaining}")
-
     if end_str:
         lines.append(f"📅 *Árverés vége:* {end_str}")
 
     lines.append(f"📊 *Státusz:* {timeline}")
-  
-    if end_str:
-        lines.append(f"📅 *Árverés vége:* {end_str}")
 
     if leiras:
         lines.append(f"\n📝 _{leiras}_")
