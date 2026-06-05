@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v6.03 – Beköltözhető ingatlanok (moveln=true)
-Szűrés: tulajdoni hányad (1/1 vagy 1/2+1/2) és max ár 1M Ft
-
-Változások (v6.03):
-  - Szakaszonkénti Ft/m² megjelenítés (1./2./3. szakasz) - optimalizált méret
-  - A szakaszok vége (hátralévő napok) a státusz sor fölé került
-  - Törölve az egyedi Ft/m² érték (a jelenlegi árból számolt)
-  - Telegram progress bar és Markdown escape javítások
+MBVK Árverési Monitor v6.04 – Beköltözhető ingatlanok (moveln=true)
+Kategorizált Telegram üzenet formátummal.
 """
 
 import csv
@@ -377,8 +371,8 @@ def calculate_phase_prices(kikialtas_ar: Optional[int]) -> Optional[Tuple[int, i
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
     stage1 = kikialtas_ar
-    stage2 = int(kikialtas_ar * 0.7)  # 2/3 helyett 70%
-    stage3 = int(kikialtas_ar / 2)    # 50%
+    stage2 = int(kikialtas_ar * 2 / 3) # <-- ITT VAN A HIBA
+    stage3 = int(kikialtas_ar / 2)
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
@@ -658,46 +652,57 @@ def send_telegram(data: Dict, indok: str = "új"):
         "árcsökkenés": "📉",
     }
     emoji = INDOK_EMOJI.get(indok, "🏠")
+    
+    # --- Kategorizált üzenet összeállítása ---
     lines = [f"{emoji} *MBVK TALÁLAT – {indok.upper()}*", ""]
 
+    # 1. Elhelyezkedés és Alapadatok
+    lines.append("🌍 *1. Elhelyezkedés és Alapadatok*")
     if cim and cim != "N/A":
         lines.append(f"📍 *Cím:* {cim}")
     if dist_str:
         lines.append(f"🗺 *Budapest-távolság:* {dist_str}")
-    if price_str:
-        lines.append(f"💰 *Jelenlegi ár:* {price_str}")
-    if legh_str:
-        lines.append(f"📈 *Legmagasabb licit:* {legh_str}")
+    lines.append("")
 
-    if phase_prices_str:
-        lines.append(f"💰 *Szakasz árak:* {phase_prices_str}")
-
-    # Szakaszonkénti Ft/m² (kompakt forma ismétlések nélkül)
-    if phase_ft_per_m2_str:
-        lines.append(f"📈 *Ft/m²:* {phase_ft_per_m2_str}")
-
+    # 2. Az Ingatlan és a Telek Jellemzői
+    lines.append("🏠 *2. Az Ingatlan és a Telek Jellemzői*")
     if telek_str:
         lines.append(f"🏕 *Telekméret:* {telek_str}")
     if epulet_str:
-        lines.append(f"🏠 *Épület alapterülete:* {epulet_str}")
+        lines.append(f"🏚 *Épület alapterülete:* {epulet_str}")
     lines.append("🚪 *Beköltözhető:* igen")
+    lines.append("")
+
+    # 3. Pénzügyi Információk
+    lines.append("💰 *3. Pénzügyi Információk*")
+    if price_str:
+        lines.append(f"💵 *Jelenlegi ár:* {price_str}")
+    if phase_prices_str:
+        lines.append(f"💲 *Szakasz árak:* {phase_prices_str}")
+    if phase_ft_per_m2_str:
+        lines.append(f"📉 *Ft/m²:* {phase_ft_per_m2_str}")
+    if legh_str:
+        lines.append(f"📈 *Legmagasabb licit:* {legh_str}")
+    lines.append("")
+
+    # 4. Jogi és Árverési Státusz
+    lines.append("⚖️ *4. Jogi és Árverési Státusz*")
     if hanyad:
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad}")
-    if licit_str:
-        lines.append(f"🔄 *Licitek száma:* {licit_str}")
-
-    # Szakaszok vége és Árverés vége a státusz fölé csoportosítva (duplikáció kiszűrve)
     if phase_remaining:
         lines.append(f"⏳ *Szakaszok vége:* {phase_remaining}")
     if end_str:
         lines.append(f"📅 *Árverés vége:* {end_str}")
-
+    if licit_str:
+        lines.append(f"🔄 *Licitek száma:* {licit_str}")
     lines.append(f"📊 *Státusz:* {timeline}")
-
-    if leiras:
-        lines.append(f"\n📝 _{leiras}_")
-        
     lines.append("")
+
+    # Egyéb kiegészítő információk és linkek
+    if leiras:
+        lines.append(f"📝 *Leírás:*\n_{leiras}_")
+        lines.append("")
+        
     lines.append(f"🔗 [Részletek az MBVK oldalon]({data.get('url', '')})")
     if maps_url:
         lines.append(f"🗺 [Google Térkép]({maps_url})")
@@ -725,7 +730,7 @@ def send_telegram(data: Dict, indok: str = "új"):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor v6.03 indítás – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor v6.04 indítás – %s", datetime.now().isoformat())
     if not GEOPY_OK:
         log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
