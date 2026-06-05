@@ -532,7 +532,7 @@ def extract(data: Dict) -> Dict:
     arveres_vege = g("auctionEndDate", "endDate", "auctionEnd", "deadline", "befejezesDatuma")
     arveres_kezdete = g("auctionStartDate", "startDate", "auctionStart", "kezdet", "kibocsatasDatuma")
 
-   return {
+    return {
         "megye":              megye,
         "telepules":          telepules,
         "cim":                cim,
