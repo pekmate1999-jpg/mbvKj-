@@ -607,7 +607,12 @@ def send_telegram(data: Dict, indok: str = "új"):
     epulet_str = fmt_area(epulet_m, epulet_f)
     ft_m2_str  = f"{ft_m2:,} Ft/m²".replace(",", " ") if ft_m2    else None
     hanyad_str = hanyad                                 if hanyad   else None
-    end_str    = end if end and end != "N/A"            else None
+    def fmt_date(s: Optional[str]) -> Optional[str]:
+        """'2026-07-30T12:00:00' → '2026-07-30 12:00'"""
+        if not s or s == "N/A":
+            return None
+        return s.replace("T", " ")[:16]   # levágja a másodperceket is
+    end_str    = fmt_date(end)
     dist_str   = f"{dist_km:.0f} km"                   if dist_km is not None else None
 # ... (A korábbi változódeklarációid: price_str, legh_str, stb. után) ...
 
