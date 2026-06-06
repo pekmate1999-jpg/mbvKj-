@@ -301,6 +301,17 @@ def calculate_phase_ends(
 # Visszafelé kompatibilitás: régi név is működjön
 estimate_phase_ends = calculate_phase_ends
 
+def get_current_stage(phase_ends):
+    """Visszaadja az aktualis szakasz szamat (1-3) a phase_ends lista alapjan."""
+    if not phase_ends:
+        return 1
+    now_dt = datetime.now()
+    parsed_ends = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
+    for idx, ph_end in enumerate(parsed_ends, start=1):
+        if now_dt <= ph_end:
+            return idx
+    return len(parsed_ends)
+
 def generate_timeline(
     kezdete: str,
     vege: str,
@@ -369,31 +380,36 @@ def calculate_phase_prices(
     """
     Visszaadja az 1., 2., 3. szakasz meghirdetett minimális vételárait (Ft-ban).
 
-    Az MBVK rendszere a szakaszokat csökkenő áron hirdeti meg:
-      1. szakasz: kikiáltási ár 90%-a
-      2. szakasz: kikiáltási ár 70%-a
-      3. szakasz: kikiáltási ár 50%-a
+    A Vht. 173/A-B. § szerinti prioritási logika:
+      Prioritás 1 (jelzálog):      minden szakaszban 100% → putUpPrice már ezt tükrözi
+      Prioritás 2 (lakóingatlan):  minimum 70%            → putUpPrice már ezt tükrözi
+      Prioritás 3 (általános):     minimum 50%            → putUpPrice már ezt tükrözi
 
-    Ezek a MEGHIRDETETT árak. A Vht. 173/A-B. § szerinti törvényi minimumok
-    (az érvényes ajánlat alsó határa) ennél alacsonyabbak lehetnek:
-      - Általános eset:      50% (főszabály)
-      - Lakóingatlan:        70% (ha az adós egyetlen lakóhelye)
-      - Fogyasztói jelzálog: 100% (minden szakaszban)
+    Az MBVK az API putUpPrice mezőjében MINDIG a törvény szerinti legmagasabb
+    megengedett 1. szakasz árat adja – a törvényi korrekciót már elvégezte.
+    Ebből számítjuk a 2. és 3. szakasz árait (70% / 50%), ar_tipustól függetlenül.
 
-    A legtöbb esetben a meghirdetett 90/70/50%-os árak a mérvadók,
-    a törvényi minimum csak különleges esetekben tér el.
-
-    ar_tipus hatása: "jelzalog" esetén minden szakasz = 100% (kikiáltási ár).
+    Kivétel: jelzálog esetén minden szakasz ára azonos (100% / 100% / 100%),
+    azaz a putUpPrice nem csökken szakaszról szakaszra.
     """
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
 
     if ar_tipus == "jelzalog":
-        # Fogyasztói jelzáloghitel: mindhárom szakaszban 100%
+        # Fogyasztói jelzáloghitel: minden szakaszban ugyanaz az ár (nincs csökkentés)
         return (kikialtas_ar, kikialtas_ar, kikialtas_ar)
 
-    # Általános MBVK meghirdetési logika: 90% / 70% / 50%
-    stage1 = int(kikialtas_ar * 0.90)
+    if ar_tipus == "lakoingatan":
+        # Lakóingatlan (adós egyetlen lakóhelye): 70% az alap, de a 2-3. szakasz
+        # ebből az alapból csökken tovább: 100% / 70% / 50% a putUpPrice-hoz képest.
+        # A putUpPrice már a 70%-os minimumot tükrözi (1. szakasz ár).
+        stage1 = kikialtas_ar                  # = értékbecslés 70%-a
+        stage2 = int(kikialtas_ar * 0.70)      # = értékbecslés ~49%-a
+        stage3 = int(kikialtas_ar * 0.50)      # = értékbecslés 35%-a
+        return (stage1, stage2, stage3)
+
+    # Általános eset: 100% / 70% / 50% a putUpPrice-hoz képest
+    stage1 = kikialtas_ar
     stage2 = int(kikialtas_ar * 0.70)
     stage3 = int(kikialtas_ar * 0.50)
     return (stage1, stage2, stage3)
@@ -471,6 +487,9 @@ def init_db() -> sqlite3.Connection:
     if "arveres_vege" not in cols:
         conn.execute("ALTER TABLE properties ADD COLUMN arveres_vege TEXT")
         log.info("DB séma frissítve: arveres_vege oszlop hozzáadva")
+    if "current_szakasz" not in cols:
+        conn.execute("ALTER TABLE properties ADD COLUMN current_szakasz INTEGER")
+        log.info("DB séma frissítve: current_szakasz oszlop hozzáadva")
 
     return conn
 
@@ -528,12 +547,17 @@ def extract(data: Dict) -> Dict:
     leiras_full_lower = leiras_full.lower()
     is_lakott = "lakottan" in leiras_full_lower or "haszonélvezet" in leiras_full_lower
 
-    # Ártípus meghatározása (Vht. 173/A-B. §):
-    #   "jelzalog"    – fogyasztói jelzáloghitelből eredő tartozás → 100% minden szakaszban
-    #   "lakoingatan" – lakóingatlan + adós egyetlen lakóhelye     → 70% minden szakaszban
-    #   "altalanos"   – minden más eset                            → 50% minden szakaszban
-    jelzalog_kws  = ["fogyasztói jelzáloghitel", "jelzáloghitel", "jelzálog"]
-    lakoingatan_kws = ["lakóingatlan", "lakóház", "lakás"]
+    # Ártípus meghatározása (Vht. 173/A-B. §) – prioritás sorrendben:
+    #   "jelzalog"    – fogyasztói jelzáloghitelből eredő tartozás → putUpPrice = 100%, nem csökken
+    #   "lakoingatan" – lakóingatlan + adós egyetlen lakóhelye     → putUpPrice = 70%-os alap
+    #   "altalanos"   – minden más eset                            → putUpPrice = 50%-os alap
+    #
+    # FONTOS: Az MBVK a putUpPrice-ban már a törvényi minimum szerinti árat adja,
+    # nekünk csak azt kell tudni, hogy jelzálog esetén nem csökken szakaszról szakaszra.
+    # A lakoingatan vs altalanos különbség a szakaszárak számításánál nem releváns
+    # (mindkettőnél 100%/70%/50% a putUpPrice-hoz képest), csak dokumentációs célú.
+    jelzalog_kws     = ["fogyasztói jelzáloghitel", "jelzáloghitel-szerződés"]
+    lakoingatan_kws  = ["adós egyetlen", "kizárólagos lakóhely", "lakóingatlan 70"]
     if any(kw in leiras_full_lower for kw in jelzalog_kws):
         ar_tipus = "jelzalog"
     elif any(kw in leiras_full_lower for kw in lakoingatan_kws):
@@ -541,15 +565,15 @@ def extract(data: Dict) -> Dict:
     else:
         ar_tipus = "altalanos"
 
-    # Jelenlegi ár (= az aktuális 1. szakasz meghirdetett ára):
-    # Ha van licit → legmagasabb_licit; ha nincs → 1. szakasz ár.
-    # minimum_ar az API-ban árverési előleg/licitküszöb – NEM vételár, kihagyjuk.
-    # Jelzálog esetén a kikiáltási ár 100%, egyébként az MBVK 90%-on hirdeti az 1. szakaszt.
-    stage1_ratio = 1.00 if ar_tipus == "jelzalog" else 0.90
+    # Jelenlegi ár:
+    # Az API putUpPrice mezője = kikiáltási ár = az 1. szakasz meghirdetett ára (ez már a 90%-os ár!).
+    # Az MBVK az árat közvetlenül adja meg, NEM kell belőle 90%-ot számolni.
+    # minimum_ar (minPrice) az API-ban = árverési előleg összege (downPay ≈ putUpPrice×10%) – NEM vételár!
+    # Ha van aktív licit → legmagasabb licit az aktuális ár; ha nincs → a kikiáltási ár (putUpPrice).
     if legmagasabb_licit and legmagasabb_licit > 0:
         price = legmagasabb_licit
     elif kikialtas_ar and kikialtas_ar > 0:
-        price = int(kikialtas_ar * stage1_ratio)
+        price = kikialtas_ar   # putUpPrice = az 1. szakasz ára, nem kell szorozni!
     else:
         price = None
 
@@ -709,6 +733,7 @@ def send_telegram(data: Dict, indok: str = "új"):
         "új licit":  "🔔",
         "új dátum":  "📅",
         "árcsökkenés": "📉",
+        "szakaszváltás": "🔄",
     }
     emoji = INDOK_EMOJI.get(indok, "🏠")
     
@@ -857,9 +882,12 @@ def run():
             data.get("licitek_szama"),
         )
 
+        # Aktuális szakasz meghatározása
+        current_szakasz = get_current_stage(data.get("phase_end_dates") or [])
+
         # Korábbi adatok lekérése
         existing = conn.execute(
-            "SELECT price, licit_szam, arveres_vege FROM properties WHERE auction_id = ?",
+            "SELECT price, licit_szam, arveres_vege, current_szakasz FROM properties WHERE auction_id = ?",
             (auction_id,)
         ).fetchone()
 
@@ -877,16 +905,17 @@ def run():
             else:
                 indok = "új"
             conn.execute(
-                """INSERT INTO properties (auction_id, created_at, price, licit_szam, arveres_vege)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO properties (auction_id, created_at, price, licit_szam, arveres_vege, current_szakasz)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (auction_id, datetime.now().isoformat(),
-                 current_price, current_licits, current_vege)
+                 current_price, current_licits, current_vege, current_szakasz)
             )
         else:
-            prev_price, prev_licits, prev_vege = existing
+            prev_price, prev_licits, prev_vege, prev_szakasz = existing
 
-            price_decreased  = prev_price  is not None and current_price  is not None and current_price  < prev_price
-            licit_increased  = prev_licits is not None and current_licits is not None and current_licits > prev_licits
+            price_decreased   = prev_price   is not None and current_price  is not None and current_price  < prev_price
+            licit_increased   = prev_licits  is not None and current_licits is not None and current_licits > prev_licits
+            szakasz_increased = prev_szakasz is not None and current_szakasz > prev_szakasz
 
             prev_dt = _parse_dt(prev_vege) if prev_vege and prev_vege != "N/A" else None
             curr_dt = _parse_dt(current_vege) if current_vege and current_vege != "N/A" else None
@@ -894,6 +923,8 @@ def run():
 
             if price_decreased:
                 indok = "árcsökkenés"
+            elif szakasz_increased:
+                indok = "szakaszváltás"
             elif licit_increased and date_moved_closer:
                 indok = "új licit"
             elif date_moved_closer:
@@ -901,12 +932,12 @@ def run():
             elif licit_increased:
                 indok = "új licit"
 
-            if price_decreased or licit_increased or date_moved_closer:
+            if price_decreased or licit_increased or date_moved_closer or szakasz_increased:
                 conn.execute(
                     """UPDATE properties
-                       SET price = ?, licit_szam = ?, arveres_vege = ?
+                       SET price = ?, licit_szam = ?, arveres_vege = ?, current_szakasz = ?
                        WHERE auction_id = ?""",
-                    (current_price, current_licits, current_vege, auction_id)
+                    (current_price, current_licits, current_vege, current_szakasz, auction_id)
                 )
 
         if passes_filters(data) and indok:
