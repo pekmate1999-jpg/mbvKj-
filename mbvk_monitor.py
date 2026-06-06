@@ -378,40 +378,36 @@ def calculate_phase_prices(
     ar_tipus: str = "altalanos",
 ) -> Optional[Tuple[int, int, int]]:
     """
-    Visszaadja az 1., 2., 3. szakasz meghirdetett minimális vételárait (Ft-ban).
+    Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban).
 
-    A Vht. 173/A-B. § szerinti prioritási logika:
-      Prioritás 1 (jelzálog):      minden szakaszban 100% → putUpPrice már ezt tükrözi
-      Prioritás 2 (lakóingatlan):  minimum 70%            → putUpPrice már ezt tükrözi
-      Prioritás 3 (általános):     minimum 50%            → putUpPrice már ezt tükrözi
+    Alap szakaszár-csökkentés (Vht. 145/B. §):
+      1. szakasz: putUpPrice × 90%
+      2. szakasz: putUpPrice × 70%
+      3. szakasz: putUpPrice × 50%
 
-    Az MBVK az API putUpPrice mezőjében MINDIG a törvény szerinti legmagasabb
-    megengedett 1. szakasz árat adja – a törvényi korrekciót már elvégezte.
-    Ebből számítjuk a 2. és 3. szakasz árait (70% / 50%), ar_tipustól függetlenül.
+    Prioritási szabályok (Vht. 173/A-B. §) – ha a törvényi minimum magasabb,
+    az érvényesül (legszigorúbb szabály nyer):
+      P1 – fogyasztói jelzáloghitel:              floor = putUpPrice × 100% minden szakaszban
+      P2 – lakóingatlan, adós egyetlen lakóhelye: floor = putUpPrice × 70%  minden szakaszban
+      P3 – általános eset:                        floor = putUpPrice × 50%  minden szakaszban
 
-    Kivétel: jelzálog esetén minden szakasz ára azonos (100% / 100% / 100%),
-    azaz a putUpPrice nem csökken szakaszról szakaszra.
+    Azaz: szakasz_ár = max(alap_csökkentett_ár, törvényi_floor)
     """
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
 
+    # Törvényi floor meghatározása
     if ar_tipus == "jelzalog":
-        # Fogyasztói jelzáloghitel: minden szakaszban ugyanaz az ár (nincs csökkentés)
-        return (kikialtas_ar, kikialtas_ar, kikialtas_ar)
+        floor = kikialtas_ar               # P1: 100%
+    elif ar_tipus == "lakoingatan":
+        floor = int(kikialtas_ar * 0.70)   # P2: 70%
+    else:
+        floor = int(kikialtas_ar * 0.50)   # P3: 50%
 
-    if ar_tipus == "lakoingatan":
-        # Lakóingatlan (adós egyetlen lakóhelye): 70% az alap, de a 2-3. szakasz
-        # ebből az alapból csökken tovább: 100% / 70% / 50% a putUpPrice-hoz képest.
-        # A putUpPrice már a 70%-os minimumot tükrözi (1. szakasz ár).
-        stage1 = kikialtas_ar                  # = értékbecslés 70%-a
-        stage2 = int(kikialtas_ar * 0.70)      # = értékbecslés ~49%-a
-        stage3 = int(kikialtas_ar * 0.50)      # = értékbecslés 35%-a
-        return (stage1, stage2, stage3)
-
-    # Általános eset: 100% / 70% / 50% a putUpPrice-hoz képest
-    stage1 = kikialtas_ar
-    stage2 = int(kikialtas_ar * 0.70)
-    stage3 = int(kikialtas_ar * 0.50)
+    # Alap csökkentett árak, majd floor alkalmazása
+    stage1 = max(int(kikialtas_ar * 0.90), floor)
+    stage2 = max(int(kikialtas_ar * 0.70), floor)
+    stage3 = max(int(kikialtas_ar * 0.50), floor)
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
@@ -547,33 +543,34 @@ def extract(data: Dict) -> Dict:
     leiras_full_lower = leiras_full.lower()
     is_lakott = "lakottan" in leiras_full_lower or "haszonélvezet" in leiras_full_lower
 
-    # Ártípus meghatározása (Vht. 173/A-B. §) – prioritás sorrendben:
-    #   "jelzalog"    – fogyasztói jelzáloghitelből eredő tartozás → putUpPrice = 100%, nem csökken
-    #   "lakoingatan" – lakóingatlan + adós egyetlen lakóhelye     → putUpPrice = 70%-os alap
-    #   "altalanos"   – minden más eset                            → putUpPrice = 50%-os alap
+    # Ártípus meghatározása – matematikai visszaszámítással az API mezőkből:
+    #   minPrice / putUpPrice ≈ 1.00 → P1 "jelzalog"    (100% minden szakaszban)
+    #   minPrice / putUpPrice ≈ 0.70 → P2 "lakoingatan" (70%  minden szakaszban)
+    #   minPrice / putUpPrice ≈ 0.90 → P3 "altalanos"   (90%/70%/50% csökkentéssel)
     #
-    # FONTOS: Az MBVK a putUpPrice-ban már a törvényi minimum szerinti árat adja,
-    # nekünk csak azt kell tudni, hogy jelzálog esetén nem csökken szakaszról szakaszra.
-    # A lakoingatan vs altalanos különbség a szakaszárak számításánál nem releváns
-    # (mindkettőnél 100%/70%/50% a putUpPrice-hoz képest), csak dokumentációs célú.
-    jelzalog_kws     = ["fogyasztói jelzáloghitel", "jelzáloghitel-szerződés"]
-    lakoingatan_kws  = ["adós egyetlen", "kizárólagos lakóhely", "lakóingatlan 70"]
-    if any(kw in leiras_full_lower for kw in jelzalog_kws):
-        ar_tipus = "jelzalog"
-    elif any(kw in leiras_full_lower for kw in lakoingatan_kws):
-        ar_tipus = "lakoingatan"
+    # Az API minPrice = tényleges minimum vételár (1. szakasz ára)
+    # Az API downPay  = árverési előleg (kaució) – NEM vételár
+    if kikialtas_ar and minimum_ar and kikialtas_ar > 0:
+        ratio = minimum_ar / kikialtas_ar
+        if ratio >= 0.95:
+            ar_tipus = "jelzalog"       # P1: 100% – minden szakasz azonos
+        elif ratio >= 0.75:
+            ar_tipus = "altalanos"      # P3: 90%/70%/50% – általános főszabály
+        else:
+            ar_tipus = "lakoingatan"    # P2: 70% – lakóingatlan, adós egyetlen lakóhelye
+        log.debug("ar_tipus=%s (ratio=%.2f, minPrice=%s, putUpPrice=%s)",
+                  ar_tipus, ratio, minimum_ar, kikialtas_ar)
     else:
-        ar_tipus = "altalanos"
+        ar_tipus = "altalanos"          # fallback ha valamelyik hiányzik
 
-    # Jelenlegi ár:
-    # Az API putUpPrice mezője = kikiáltási ár = az 1. szakasz meghirdetett ára (ez már a 90%-os ár!).
-    # Az MBVK az árat közvetlenül adja meg, NEM kell belőle 90%-ot számolni.
-    # minimum_ar (minPrice) az API-ban = árverési előleg összege (downPay ≈ putUpPrice×10%) – NEM vételár!
-    # Ha van aktív licit → legmagasabb licit az aktuális ár; ha nincs → a kikiáltási ár (putUpPrice).
+    # Jelenlegi ár: az API minPrice tartalmazza a tényleges 1. szakasz minimum vételárat.
+    # Ha van aktív licit → legmagasabb licit az aktuális ár.
     if legmagasabb_licit and legmagasabb_licit > 0:
         price = legmagasabb_licit
+    elif minimum_ar and minimum_ar > 0:
+        price = minimum_ar
     elif kikialtas_ar and kikialtas_ar > 0:
-        price = kikialtas_ar   # putUpPrice = az 1. szakasz ára, nem kell szorozni!
+        price = int(kikialtas_ar * 0.90)    # végső fallback
     else:
         price = None
 
