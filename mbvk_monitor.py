@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v7.00 – Beköltözhető ingatlanok (moveln=true)
+MBVK Árverési Monitor v7.1 – Beköltözhető ingatlanok (moveln=true)
+Vármegye, javított szakaszok
 Kategorizált Telegram üzenet formátummal.
 """
 
@@ -30,12 +31,35 @@ except ImportError:
 TELEPULES_MAP: Dict[str, str] = {}
 
 def load_telepules_map():
+    """
+    Betölti a telepulesek.csv-t egy {normalize(helység) -> megye} szótárba.
+
+    A CSV első 3 sora (üres + fejléc + törött 2. fejlécsor) skip-elésre kerül.
+    A "fõváros" (latin-2 hibás kódolású) → "főváros" normalizálva lesz.
+    Budapest kerületei (Budapest 01. ker. stb.) → "Budapest (főváros)".
+    """
     try:
-        with open("telepulesek.csv", mode='r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter=';')
+        with open("telepulesek.csv", mode="r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter=";")
+            skip = 3   # üres sor + "Helység;Megye..." fejléc + törött "megnevezése;" sor
             for row in reader:
-                if len(row) >= 2:
-                    TELEPULES_MAP[normalize(row[0].strip())] = row[1].strip()
+                if skip > 0:
+                    skip -= 1
+                    continue
+                if len(row) < 2:
+                    continue
+                helyseg = row[0].strip()
+                megye_raw = row[1].strip()
+                if not helyseg or not megye_raw:
+                    continue
+                # latin-2 → unicode javítás a "fõváros" esetére
+                megye_clean = megye_raw.replace("fõváros", "főváros").replace("fovaros", "főváros")
+                # Budapest kerületek egységesítése
+                if helyseg.lower().startswith("budapest") and "ker." in helyseg.lower():
+                    megye_clean = "Budapest (főváros)"
+                elif helyseg.lower() == "budapest":
+                    megye_clean = "Budapest (főváros)"
+                TELEPULES_MAP[normalize(helyseg)] = megye_clean
         log.info("Település mappa betöltve: %d elem", len(TELEPULES_MAP))
     except FileNotFoundError:
         log.warning("telepulesek.csv nem található – megye kiegészítés nem működik")
@@ -396,18 +420,16 @@ def calculate_phase_prices(
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
 
-    # Törvényi floor meghatározása
+    # Fogyasztói jelzáloghitel: minden szakaszban 100% (kikiáltási ár)
     if ar_tipus == "jelzalog":
-        floor = kikialtas_ar               # P1: 100%
-    elif ar_tipus == "lakoingatan":
-        floor = int(kikialtas_ar * 0.70)   # P2: 70%
-    else:
-        floor = int(kikialtas_ar * 0.50)   # P3: 50%
+        return (kikialtas_ar, kikialtas_ar, kikialtas_ar)
 
-    # Alap csökkentett árak, majd floor alkalmazása
-    stage1 = max(int(kikialtas_ar * 0.90), floor)
-    stage2 = max(int(kikialtas_ar * 0.70), floor)
-    stage3 = max(int(kikialtas_ar * 0.50), floor)
+    # Általános MBVK meghirdetési logika: 90% / 70% / 50%
+    # A Vht. 173/A-B. § szerinti törvényi minimumok az érvényes ajánlat alsó
+    # határát szabják meg, de az MBVK mindig csökkenő áron hirdeti a szakaszokat.
+    stage1 = int(kikialtas_ar * 0.90)
+    stage2 = int(kikialtas_ar * 0.70)
+    stage3 = int(kikialtas_ar * 0.50)
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
@@ -511,6 +533,9 @@ def extract(data: Dict) -> Dict:
 
     cim_parts = []
     irsz = addr.get("zipCode") or addr.get("postCode")
+    # Budapest kerület fallback irányítószámból (1xxx → Budapest főváros)
+    if not megye and irsz and re.match(r"^1\d{3}$", str(irsz).strip()):
+        megye = "Budapest (főváros)"
     if irsz:
         cim_parts.append(str(irsz))
     if telepules:
@@ -738,9 +763,12 @@ def send_telegram(data: Dict, indok: str = "új"):
     lines = [f"{emoji} *MBVK TALÁLAT – {indok.upper()}*", ""]
 
     # 1. Elhelyezkedés és Alapadatok
+    megye_str = escape_markdown(data.get("megye", "") or "")
     lines.append("🌍 *1. Elhelyezkedés és Alapadatok*")
     if cim and cim != "N/A":
         lines.append(f"📍 *Cím:* {cim}")
+    if megye_str:
+        lines.append(f"🏛 *Megye:* {megye_str}")
     if dist_str:
         lines.append(f"🗺 *Budapest-távolság:* {dist_str}")
     lines.append("")
