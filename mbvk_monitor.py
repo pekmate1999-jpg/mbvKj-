@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v7.1 – Beköltözhető ingatlanok (moveln=true)
-Vármegye, javított szakaszok
+MBVK Árverési Monitor v7.2 – Beköltözhető ingatlanok (moveln=true)
+Vármegye, javított szakaszok, négyzetzméter javitások, vezetékjog
 Kategorizált Telegram üzenet formátummal.
 """
 
@@ -94,6 +94,24 @@ def normalize(text: str) -> str:
     nfkd = unicodedata.normalize("NFKD", text.lower())
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
+def parse_hungarian_float(s: str) -> Optional[float]:
+    """
+    Magyar számformátum (pl. '1.590' -> 1590.0, '1,5' -> 1.5, '1 000,5' -> 1000.5)
+    átalakítása float-ra.
+    """
+    if not s:
+        return None
+    # Szóközök eltávolítása
+    s = s.strip().replace(" ", "")
+    # Pont (ezres elválasztó) eltávolítása
+    s = s.replace(".", "")
+    # Vessző (tizedes) átalakítása ponttá
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
 def parse_price(val) -> Optional[int]:
     if val is None:
         return None
@@ -101,15 +119,17 @@ def parse_price(val) -> Optional[int]:
     return int(digits) if digits else None
 
 def parse_area(val) -> Optional[float]:
+    """
+    Kinyeri az első előforduló számot (magyar formátumban) a szöveges értékből.
+    Pl. '1.590 m²' -> 1590.0, '65 m2' -> 65.0
+    """
     if val is None:
         return None
     s = str(val).strip()
+    # Megkeressük az első számot (tizedesvesszőt és ezres pontot is kezelve)
     m = re.search(r"([\d]+(?:[.,][\d]+)?)", s)
     if m:
-        try:
-            return float(m.group(1).replace(",", "."))
-        except ValueError:
-            pass
+        return parse_hungarian_float(m.group(1))
     return None
 
 def escape_markdown(text: str) -> str:
@@ -128,19 +148,30 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
         return None, None
 
     desc_lower = desc.lower()
-    pattern = re.compile(r"(\d+(?:[.,]\d+)?)\s*m[²2]", re.IGNORECASE)
+    # Kiterjesztett mértékegységek: m2, m², nm, négyzetméter
+    pattern = re.compile(
+        r"(\d+(?:[.,]\d+)?)\s*(?:m[²2]|nm|négyzetméter)",
+        re.IGNORECASE
+    )
     
     telek_matches = []
     epulet_candidates = []
     
-    epulet_prior_kws = ["lakóház", "lakás", "épület", "hasznos alapterület"]
-    epulet_blacklist = ["vezetékjog", "szolgalmi jog", "terhel", "bejegyzett", "terheli"]
+    epulet_prior_kws = [
+        "lakóház", "lakás", "épület", "hasznos alapterület",
+        "alapterület", "alapterülete"          # bővítés
+    ]
+    # Ezek a kontextusok NEM épület- és NEM telekméretként értelmezhetők
+    # (pl. "VMM-611/2012 engedélyszámú... 12 m2 területre" – vezetékjog terheli)
+    area_blacklist = [
+        "vezetékjog", "szolgalmi jog", "terhel", "terheli",
+        "bejegyzett", "engedélyszám", "javára", "vázrajz",
+    ]
     
     for match in pattern.finditer(desc_lower):
-        num_str = match.group(1).replace(",", ".")
-        try:
-            val = float(num_str)
-        except ValueError:
+        num_str = match.group(1)
+        val = parse_hungarian_float(num_str)
+        if val is None:
             continue
         
         if val < 5 or val > 250_000:
@@ -148,18 +179,27 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
         
         start = match.start()
         end = match.end()
-        ctx_start = max(0, start - 60)
-        ctx_end = min(len(desc_lower), end + 60)
-        context = desc_lower[ctx_start:ctx_end]
+
+        # Szűk ablak (±40 kar) a blacklist ellenőrzéséhez – csak a szám
+        # közvetlen közelében lévő jogi szöveg zárja ki az értéket
+        bl_start = max(0, start - 40)
+        bl_end   = min(len(desc_lower), end + 40)
+        bl_ctx   = desc_lower[bl_start:bl_end]
+
+        # Tágabb ablak (±80 kar) az épület/telek kulcsszó felismeréséhez
+        ctx_start = max(0, start - 80)
+        ctx_end   = min(len(desc_lower), end + 80)
+        context   = desc_lower[ctx_start:ctx_end]
+        
+        # Ha a szűk kontextusban jogi/közjogi utalás szerepel → ez nem valódi terület
+        blacklisted = any(kw in bl_ctx for kw in area_blacklist)
+        if blacklisted:
+            continue
         
         telek_kws = ["telek", "udvar", "terület"]
         is_telek = any(kw in context for kw in telek_kws)
         if is_telek:
             telek_matches.append(val)
-        
-        blacklisted = any(kw in context for kw in epulet_blacklist)
-        if blacklisted:
-            continue
         
         best_dist = None
         for kw in epulet_prior_kws:
