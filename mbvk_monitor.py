@@ -143,12 +143,13 @@ def escape_markdown(text: str) -> str:
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
+# parse_sizes_from_description függvény módosítása
+
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
     if not desc:
         return None, None
 
     desc_lower = desc.lower()
-    # Kiterjesztett mértékegységek: m2, m², nm, négyzetméter
     pattern = re.compile(
         r"(\d+(?:[.,]\d+)?)\s*(?:m[²2]|nm|négyzetméter)",
         re.IGNORECASE
@@ -157,12 +158,14 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
     telek_matches = []
     epulet_candidates = []
     
+    # Telek kulcsszavak: "telek", "udvar", "ingatlan" (a "terület" túl általános, elhagyjuk)
+    telek_kws = ["telek", "udvar", "ingatlan"]
+    
     epulet_prior_kws = [
         "lakóház", "lakás", "épület", "hasznos alapterület",
-        "alapterület", "alapterülete"          # bővítés
+        "alapterület", "alapterülete"
     ]
-    # Ezek a kontextusok NEM épület- és NEM telekméretként értelmezhetők
-    # (pl. "VMM-611/2012 engedélyszámú... 12 m2 területre" – vezetékjog terheli)
+    
     area_blacklist = [
         "vezetékjog", "szolgalmi jog", "terhel", "terheli",
         "bejegyzett", "engedélyszám", "javára", "vázrajz",
@@ -173,34 +176,25 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
         val = parse_hungarian_float(num_str)
         if val is None:
             continue
-        
         if val < 5 or val > 250_000:
             continue
         
         start = match.start()
         end = match.end()
-
-        # Szűk ablak (±40 kar) a blacklist ellenőrzéséhez – csak a szám
-        # közvetlen közelében lévő jogi szöveg zárja ki az értéket
+        
+        # Feketelista ellenőrzés (szűk ablak)
         bl_start = max(0, start - 40)
         bl_end   = min(len(desc_lower), end + 40)
         bl_ctx   = desc_lower[bl_start:bl_end]
-
-        # Tágabb ablak (±80 kar) az épület/telek kulcsszó felismeréséhez
+        if any(kw in bl_ctx for kw in area_blacklist):
+            continue
+        
+        # Tágabb kontextus (kulcsszavak kereséséhez)
         ctx_start = max(0, start - 80)
         ctx_end   = min(len(desc_lower), end + 80)
         context   = desc_lower[ctx_start:ctx_end]
         
-        # Ha a szűk kontextusban jogi/közjogi utalás szerepel → ez nem valódi terület
-        blacklisted = any(kw in bl_ctx for kw in area_blacklist)
-        if blacklisted:
-            continue
-        
-        telek_kws = ["telek", "udvar", "terület"]
-        is_telek = any(kw in context for kw in telek_kws)
-        if is_telek:
-            telek_matches.append(val)
-        
+        # --- Először épület kulcsszavak keresése ---
         best_dist = None
         for kw in epulet_prior_kws:
             kw_pos = context.find(kw)
@@ -209,9 +203,16 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
                 dist = abs(abs_kw_pos - start)
                 if best_dist is None or dist < best_dist:
                     best_dist = dist
-                    
+        
+        # Ha találtunk épület kulcsszót, akkor ez épület méret, és nem telek
         if best_dist is not None:
             epulet_candidates.append((val, best_dist))
+            continue   # <- fontos: nem megyünk tovább a telek ellenőrzésre
+        
+        # --- Ha nincs épület kulcsszó, akkor telek-e? ---
+        is_telek = any(kw in context for kw in telek_kws)
+        if is_telek:
+            telek_matches.append(val)
     
     telek = max(telek_matches) if telek_matches else None
     
@@ -220,9 +221,6 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
         epulet_candidates.sort(key=lambda x: (x[1], -x[0]))
         epulet = epulet_candidates[0][0]
     
-    if telek is not None and epulet is not None and epulet >= telek:
-        epulet = None
-        
     return telek, epulet
 
 # ── Budapest-távolság (geopy) ─────────────────────────────────────────────────
