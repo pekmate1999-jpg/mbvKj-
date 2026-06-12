@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v7.2 – Beköltözhető ingatlanok (moveln=true)
-Vármegye, javított szakaszok, négyzetzméter javitások, vezetékjog
+MBVK Árverési Monitor v7.2.1 – Beköltözhető ingatlanok (moveln=true)
+Vármegye, javított szakaszok, négyzetzméter javitások, vezetékjog, telekméret hibák további javítása
 Kategorizált Telegram üzenet formátummal.
 """
 
