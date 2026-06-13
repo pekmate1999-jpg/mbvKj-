@@ -2,7 +2,7 @@
 """
 MBVK Árverési Monitor v7.2.1 – Beköltözhető ingatlanok (moveln=true)
 Vármegye, javított szakaszok, négyzetzméter javitások, vezetékjog, telekméret hibák további javítása
-Kategorizált Telegram üzenet formátummal + Google Naptár integrációval.
+Kategorizált Telegram üzenet formátummal.
 """
 
 import csv
@@ -34,6 +34,7 @@ TELEPULES_MAP: Dict[str, str] = {}
 def load_telepules_map():
     """
     Betölti a telepulesek.csv-t egy {normalize(helység) -> megye} szótárba.
+
     A CSV első 3 sora (üres + fejléc + törött 2. fejlécsor) skip-elésre kerül.
     A "fõváros" (latin-2 hibás kódolású) → "főváros" normalizálva lesz.
     Budapest kerületei (Budapest 01. ker. stb.) → "Budapest (főváros)".
@@ -142,63 +143,49 @@ def escape_markdown(text: str) -> str:
     escape_chars = r"_*[`"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
-def generate_gcal_url(title, date_str, location="", details=""):
+def generate_gcal_url(title: str, date_str: str, location: str = "", details: str = "") -> Optional[str]:
     """
     Készít egy Google Calendar URL-t az MBVK dátumaiból.
     Átváltja UTC-vé és ctz paramétert ad hozzá a mobilos appokhoz.
     """
     if not date_str or date_str == "N/A":
         return None
-
     try:
         import zoneinfo
         bp_tz = zoneinfo.ZoneInfo("Europe/Budapest")
     except Exception:
         bp_tz = None
-
     try:
-        # Keresünk dátum-idő formátumot (pl. 2024.05.12. 10:00 vagy 2024-05-12 10:00)
         matches = re.findall(r'(\d{4})[-.]\s*(\d{2})[-.]\s*(\d{2})[^\d]*(\d{2}):(\d{2})', date_str)
-        
         if not matches:
             return None
-
-        # Év, Hónap, Nap, Óra, Perc kinyerése
         y, m, d, h, minute = matches[0]
         start_dt = datetime(int(y), int(m), int(d), int(h), int(minute))
-        
-        # Alapértelmezetten 1 órás eseményt csinálunk a naptárban
         end_dt = start_dt + timedelta(hours=1)
-
-        # UTC átváltás a mobilos appok miatt
         if bp_tz:
             start_dt = start_dt.replace(tzinfo=bp_tz)
             end_dt = end_dt.replace(tzinfo=bp_tz)
-            start_utc = start_dt.astimezone(timezone.utc)
-            end_utc = end_dt.astimezone(timezone.utc)
-            start_str = start_utc.strftime("%Y%m%dT%H%M00Z")
-            end_str = end_utc.strftime("%Y%m%dT%H%M00Z")
+            start_str = start_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M00Z")
+            end_str   = end_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M00Z")
         else:
             start_str = start_dt.strftime("%Y%m%dT%H%M00")
-            end_str = end_dt.strftime("%Y%m%dT%H%M00")
-
-        # URL összeállítása
-        url = f"https://calendar.google.com/calendar/render?action=TEMPLATE"
-        url += f"&text={urllib.parse.quote(title)}"
-        url += f"&dates={start_str}/{end_str}"
-        url += f"&ctz=Europe/Budapest"
-        
+            end_str   = end_dt.strftime("%Y%m%dT%H%M00")
+        url = (f"https://calendar.google.com/calendar/render?action=TEMPLATE"
+               f"&text={urllib.parse.quote(title)}"
+               f"&dates={start_str}/{end_str}"
+               f"&ctz=Europe/Budapest")
         if location and location != "N/A":
             url += f"&location={urllib.parse.quote(location)}"
         if details:
             url += f"&details={urllib.parse.quote(details)}"
-            
         return url
     except Exception as e:
-        log.warning(f"Nem sikerült a naptár link generálása MBVK-hoz: {e}")
+        log.warning("Nem sikerült a naptár link generálása: %s", e)
         return None
 
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
+# parse_sizes_from_description függvény módosítása
+
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
     if not desc:
         return None, None
@@ -372,6 +359,13 @@ def calculate_phase_ends(
 ) -> List[str]:
     """
     MBVK szakasz-határok pontos kiszámítása (Vht. 145/B. §).
+
+    Az MBVK API az auctionEndDate mezőben MINDIG a teljes árverés végét adja,
+    a startDate mezőben MINDIG a teljes árverés kezdetét. A három szakasz
+    egyenlő hosszú, pontosan harmadolva a teljes időtartamot.
+
+    Ha a licitek száma eléri a minimum árat (azaz minimum_ar >= kikialtas_ar),
+    az árverés az aktuális szakasz végén lezárul – ilyenkor csak 1 dátumot adunk.
     """
     start_dt = _parse_dt(arveres_kezdete)
     end_dt   = _parse_dt(arveres_vege)
@@ -383,6 +377,7 @@ def calculate_phase_ends(
     if total_sec <= 0:
         return []
 
+    # Az időpont-rész megőrzése (pl. "15:00:00")
     time_part = "15:00:00"
     if arveres_vege and "T" in arveres_vege:
         time_part = arveres_vege.split("T")[1]
@@ -392,18 +387,25 @@ def calculate_phase_ends(
     def fmt(dt: "datetime") -> str:
         return f"{dt.strftime('%Y-%m-%d')}T{time_part}"
 
+    # Egyenlő szakaszhosszak: teljes időtartam / 3
     phase_sec = total_sec / 3
     phase1_end = start_dt + timedelta(seconds=phase_sec)
     phase2_end = start_dt + timedelta(seconds=phase_sec * 2)
-    phase3_end = end_dt  
+    phase3_end = end_dt  # pontosan az API-tól kapott vége
 
+    # Ha az árverés már lezárult (minimum ár teljesítve), csak a tényleges záró dátumot adjuk
     if licit_szam and minimum_ar and kikialtas_ar and minimum_ar >= kikialtas_ar:
         log.debug("Árverés lezárult (min_ar >= kiki_ar): csak 1 dátum")
         return [fmt(phase3_end)]
 
     return [fmt(phase1_end), fmt(phase2_end), fmt(phase3_end)]
 
+
+# Visszafelé kompatibilitás: régi név is működjön
+estimate_phase_ends = calculate_phase_ends
+
 def get_current_stage(phase_ends):
+    """Visszaadja az aktualis szakasz szamat (1-3) a phase_ends lista alapjan."""
     if not phase_ends:
         return 1
     now_dt = datetime.now()
@@ -420,9 +422,18 @@ def generate_timeline(
     min_ar: Optional[int],
     phase_ends: Optional[List[str]] = None,
 ) -> str:
+    """
+    Vizuális haladás-sáv + szakasz info a Telegram üzenethez.
+    Kompakt, 9-karakteres verzió a sortörések elkerülésére.
+
+    A haladás-sáv a TELJES árverés (kezdete→utolsó szakasz vége) alapján számít.
+    Az aktuális szakasz meghatározása a phase_ends listából történik.
+    """
     now_dt = datetime.now()
+
     start_dt = _parse_dt(kezdete)
 
+    # A progress-sávhoz a teljes árverés végét (= utolsó szakasz vége) használjuk
     if phase_ends:
         parsed_ends = sorted(filter(None, [_parse_dt(e) for e in phase_ends]))
         total_end_dt = parsed_ends[-1] if parsed_ends else _parse_dt(vege)
@@ -443,13 +454,15 @@ def generate_timeline(
     blocks = ["█" if i < filled else "░" for i in range(9)]
     bar_str = f"`[{''.join(blocks[0:3])}|{''.join(blocks[3:6])}|{''.join(blocks[6:9])}]` {int(progress * 100)}%"
 
+    # Aktuális szakasz: az első olyan szakasz, amelynek vége még nem múlt el
     if phase_ends:
-        current_stage = len(parsed_ends) 
+        current_stage = len(parsed_ends)  # alapértelmezett: utolsó (lezárult esetén)
         for idx, ph_end in enumerate(parsed_ends, start=1):
             if now_dt <= ph_end:
                 current_stage = idx
                 break
     else:
+        # phase_ends nélkül: időarány alapján
         if progress < 0.333:
             current_stage = 1
         elif progress < 0.666:
@@ -467,23 +480,48 @@ def calculate_phase_prices(
     kikialtas_ar: Optional[int],
     ar_tipus: str = "altalanos",
 ) -> Optional[Tuple[int, int, int]]:
+    """
+    Visszaadja az 1., 2., 3. szakasz minimális vételárait (Ft-ban).
+
+    Alap szakaszár-csökkentés (Vht. 145/B. §):
+      1. szakasz: putUpPrice × 90%
+      2. szakasz: putUpPrice × 70%
+      3. szakasz: putUpPrice × 50%
+
+    Prioritási szabályok (Vht. 173/A-B. §) – ha a törvényi minimum magasabb,
+    az érvényesül (legszigorúbb szabály nyer):
+      P1 – fogyasztói jelzáloghitel:              floor = putUpPrice × 100% minden szakaszban
+      P2 – lakóingatlan, adós egyetlen lakóhelye: floor = putUpPrice × 70%  minden szakaszban
+      P3 – általános eset:                        floor = putUpPrice × 50%  minden szakaszban
+
+    Azaz: szakasz_ár = max(alap_csökkentett_ár, törvényi_floor)
+    """
     if not kikialtas_ar or kikialtas_ar <= 0:
         return None
 
+    # Fogyasztói jelzáloghitel: minden szakaszban 100% (kikiáltási ár)
     if ar_tipus == "jelzalog":
         return (kikialtas_ar, kikialtas_ar, kikialtas_ar)
 
+    # Általános MBVK meghirdetési logika: 90% / 70% / 50%
+    # A Vht. 173/A-B. § szerinti törvényi minimumok az érvényes ajánlat alsó
+    # határát szabják meg, de az MBVK mindig csökkenő áron hirdeti a szakaszokat.
     stage1 = int(kikialtas_ar * 0.90)
     stage2 = int(kikialtas_ar * 0.70)
     stage3 = int(kikialtas_ar * 0.50)
     return (stage1, stage2, stage3)
 
 def format_phase_prices(prices: Tuple[int, int, int]) -> str:
+    """
+    Formázza a szakasz árakat.
+    Ha mindhárom egyforma (pl. fogyasztói jelzáloghitel eset), tömören mutatjuk.
+    """
     if prices[0] == prices[1] == prices[2]:
         return f"{prices[0]:,} Ft (minden szakaszban)".replace(",", " ")
     return f"{prices[0]:,} Ft / {prices[1]:,} Ft / {prices[2]:,} Ft".replace(",", " ")
 
 def calculate_phase_ft_per_m2(phase_prices: Tuple[int, int, int], ref_area: Optional[float]) -> Optional[Tuple[int, int, int]]:
+    """Kiszámolja a szakaszonkénti Ft/m² értékeket (kerekítve)."""
     if not ref_area or ref_area <= 0:
         return None
     return (
@@ -493,9 +531,14 @@ def calculate_phase_ft_per_m2(phase_prices: Tuple[int, int, int], ref_area: Opti
     )
 
 def format_phase_ft_per_m2(ft_per_m2: Tuple[int, int, int]) -> str:
+    """Formázza a szakaszonkénti Ft/m² értékeket: '260 Ft/m² / 173 Ft/m² / 130 Ft/m²'"""
     return f"{ft_per_m2[0]:,} Ft/m² / {ft_per_m2[1]:,} Ft/m² / {ft_per_m2[2]:,} Ft/m²".replace(",", " ")
 
 def format_phase_remaining_days(phase_ends: Optional[List[str]]) -> Optional[str]:
+    """
+    A szakaszok végdátumaiból kiszámolja a hátralévő napokat.
+    Visszaad egy stringet: "5 nap, 15 nap, 25 nap" vagy None.
+    """
     if not phase_ends:
         return None
     now = datetime.now()
@@ -569,6 +612,7 @@ def extract(data: Dict) -> Dict:
 
     cim_parts = []
     irsz = addr.get("zipCode") or addr.get("postCode")
+    # Budapest kerület fallback irányítószámból (1xxx → Budapest főváros)
     if not megye and irsz and re.match(r"^1\d{3}$", str(irsz).strip()):
         megye = "Budapest (főváros)"
     if irsz:
@@ -599,26 +643,38 @@ def extract(data: Dict) -> Dict:
     leiras_full = g("description", "leiras", "propertyDescription") or ""
     leiras = leiras_full[:200].rstrip() if leiras_full else ""
 
+    # Lakottság és ártípus detektálása a leírás alapján (price kiszámítása előtt!)
     leiras_full_lower = leiras_full.lower()
     is_lakott = "lakottan" in leiras_full_lower or "haszonélvezet" in leiras_full_lower
 
+    # Ártípus meghatározása – matematikai visszaszámítással az API mezőkből:
+    #   minPrice / putUpPrice ≈ 1.00 → P1 "jelzalog"    (100% minden szakaszban)
+    #   minPrice / putUpPrice ≈ 0.70 → P2 "lakoingatan" (70%  minden szakaszban)
+    #   minPrice / putUpPrice ≈ 0.90 → P3 "altalanos"   (90%/70%/50% csökkentéssel)
+    #
+    # Az API minPrice = tényleges minimum vételár (1. szakasz ára)
+    # Az API downPay  = árverési előleg (kaució) – NEM vételár
     if kikialtas_ar and minimum_ar and kikialtas_ar > 0:
         ratio = minimum_ar / kikialtas_ar
         if ratio >= 0.95:
-            ar_tipus = "jelzalog"       
+            ar_tipus = "jelzalog"       # P1: 100% – minden szakasz azonos
         elif ratio >= 0.75:
-            ar_tipus = "altalanos"      
+            ar_tipus = "altalanos"      # P3: 90%/70%/50% – általános főszabály
         else:
-            ar_tipus = "lakoingatan"    
+            ar_tipus = "lakoingatan"    # P2: 70% – lakóingatlan, adós egyetlen lakóhelye
+        log.debug("ar_tipus=%s (ratio=%.2f, minPrice=%s, putUpPrice=%s)",
+                  ar_tipus, ratio, minimum_ar, kikialtas_ar)
     else:
-        ar_tipus = "altalanos"          
+        ar_tipus = "altalanos"          # fallback ha valamelyik hiányzik
 
+    # Jelenlegi ár: az API minPrice tartalmazza a tényleges 1. szakasz minimum vételárat.
+    # Ha van aktív licit → legmagasabb licit az aktuális ár.
     if legmagasabb_licit and legmagasabb_licit > 0:
         price = legmagasabb_licit
     elif minimum_ar and minimum_ar > 0:
         price = minimum_ar
     elif kikialtas_ar and kikialtas_ar > 0:
-        price = int(kikialtas_ar * 0.90)    
+        price = int(kikialtas_ar * 0.90)    # végső fallback
     else:
         price = None
 
@@ -638,6 +694,7 @@ def extract(data: Dict) -> Dict:
     telek_meret  = telek_api  or telek_leiras
     epulet_meret = epulet_api or epulet_leiras
 
+    # Referencia terület: telek > épület > None
     if telek_meret is not None and telek_meret > 0:
         ref_area = telek_meret
     elif epulet_meret is not None and epulet_meret > 0:
@@ -717,11 +774,11 @@ def send_telegram(data: Dict, indok: str = "új"):
         log.warning("Telegram nincs beállítva (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID hiányzik)")
         return
 
-    # Naptár linkhez mentjük a NYERS szövegeket mielőtt escape-elnénk
+    # Nyers értékek mentése (naptár linkhez, escape előtt)
     cim_raw = data.get("cim", "N/A")
     url_raw = data.get("url", "")
-    
-    # Alapadatok escape-elése (Markdown védelméhez)
+
+    # Alapadatok escape-elése
     cim      = escape_markdown(cim_raw)
     price    = data.get("price")
     legh     = data.get("legmagasabb_licit")
@@ -750,7 +807,7 @@ def send_telegram(data: Dict, indok: str = "új"):
 
     price_str  = f"{price:,} Ft".replace(",", " ")     if price    else None
     legh_str   = f"{legh:,} Ft".replace(",", " ")      if legh     else None
-    licit_str  = str(licit_n)                            if licit_n > 0 else None
+    licit_str  = str(licit_n)                           if licit_n > 0 else None
     telek_str  = fmt_area(telek_m, telek_f)
     epulet_str = fmt_area(epulet_m, epulet_f)
 
@@ -758,18 +815,17 @@ def send_telegram(data: Dict, indok: str = "új"):
         if not s or s == "N/A":
             return None
         return s.replace("T", " ")[:16]
-        
     end_str    = fmt_date(end)
     dist_str   = f"{dist_km:.0f} km"                   if dist_km is not None else None
 
-    # Visszaszámlálás / Szakaszok vége link generálása
+    # Google Calendar link generálása az árverés végéhez
     end_gcal_url = None
     if end_str:
         end_gcal_url = generate_gcal_url(
             title=f"MBVK Árverés Vége: {cim_raw}",
             date_str=end_str,
             location=cim_raw,
-            details=f"Részletek: {url_raw}"
+            details=f"Részletek: {url_raw}",
         )
 
     timeline = generate_timeline(
@@ -837,14 +893,11 @@ def send_telegram(data: Dict, indok: str = "új"):
         lines.append(f"📄 *Tulajdoni hányad:* {hanyad}")
     if phase_remaining:
         lines.append(f"⏳ *Szakaszok vége:* {phase_remaining}")
-        
-    # --- Dátum és naptár link ---
     if end_str:
         if end_gcal_url:
             lines.append(f"📅 *Árverés vége:* [{end_str}]({end_gcal_url})")
         else:
             lines.append(f"📅 *Árverés vége:* {end_str}")
-            
     if licit_str:
         lines.append(f"🔄 *Licitek száma:* {licit_str}")
     lines.append(f"📊 *Státusz:* {timeline}")
@@ -855,77 +908,178 @@ def send_telegram(data: Dict, indok: str = "új"):
         lines.append(f"📝 *Leírás:*\n_{leiras}_")
         lines.append("")
         
-    # ── LEVÁGOTT RÉSZ JAVÍTÁSA ÉS BEFEJEZÉSE ──
-    if url_raw:
-        lines.append(f"🔗 [Részletek az MBVK oldalán]({url_raw})")
+    lines.append(f"🔗 [Részletek az MBVK oldalon]({data.get('url', '')})")
     if maps_url:
         lines.append(f"🗺 [Google Térkép]({maps_url})")
 
     text = "\n".join(lines)
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
-    }
+
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        log.error("Telegram küldési hiba: %s\nÜzenet: %s", e, text)
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id":                  TELEGRAM_CHAT_ID,
+                "text":                     text,
+                "parse_mode":               "Markdown",
+                "disable_web_page_preview": False,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            log.info("✉️  Telegram elküldve: %s", data.get("auction_id"))
+        else:
+            log.error("Telegram hiba: %s %s", resp.status_code, resp.text[:300])
+    except Exception as exc:
+        log.error("Telegram küldési hiba: %s", exc)
 
-
-# ── Fő futtatási blokk (Pótolva, hogy teljes legyen a script) ───────────────
-def main():
-    log.info("MBVK Árverési Monitor indul...")
+# ── Főprogram ─────────────────────────────────────────────────────────────────
+def run():
     load_telepules_map()
-    db = init_db()
+    log.info("MBVK Monitor v7.3 indítás – %s", datetime.now().isoformat())
+    if not GEOPY_OK:
+        log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram beállítások hiányoznak – értesítések nem lesznek elküldve.")
+
+    conn = init_db()
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    items = api_list(session)
-    for row in items:
-        exec_id = row.get("executiveId")
-        auction_id = row.get("id")
+    items: List[Dict] = []
+    offset = 0
+    while True:
+        batch = api_list(session, offset=offset, limit=100)
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+        offset += 100
+        time.sleep(1)
+
+    log.info("Összesen %d beköltözhető árverés a listában", len(items))
+    if not items:
+        conn.close()
+        return
+
+    new_count = notified_count = 0
+
+    for item in items:
+        exec_id    = str(item.get("auctionId") or "")
+        auction_id = str(item.get("auctionItemId") or item.get("id") or "")
         if not exec_id or not auction_id:
             continue
-        
-        # Adatbázis ellenőrzés
-        cursor = db.execute("SELECT price FROM properties WHERE auction_id = ?", (str(auction_id),))
-        record = cursor.fetchone()
 
-        detail_data = api_detail(session, exec_id, auction_id)
-        if not detail_data:
+        url = f"{BASE_URL}/arveres-reszletek/{exec_id}/{auction_id}"
+
+        detail = api_detail(session, exec_id, auction_id)
+        if not detail:
             continue
 
-        # Szakasz kalkuláció beágyazása
-        detail_data["phase_end_dates"] = calculate_phase_ends(
-            detail_data.get("auctionStartDate", ""),
-            detail_data.get("auctionEndDate", ""),
-            detail_data.get("bidCount", 0),
-            parse_price(detail_data.get("minPrice")),
-            parse_price(detail_data.get("putUpPrice"))
+        data = extract(detail)
+        data["auction_id"] = auction_id
+        data["url"] = url
+
+        # Szakasz-határok pontos kiszámítása (Vht. 145/B. §)
+        phase_ends = calculate_phase_ends(
+            data.get("arveres_kezdete", ""),
+            data.get("arveres_vege", ""),
+            licit_szam   = data.get("licitek_szama", 0),
+            minimum_ar   = data.get("minimum_ar"),
+            kikialtas_ar = data.get("kikialtas_ar"),
+        )
+        if phase_ends:
+            data["phase_end_dates"] = phase_ends
+            # arveres_vege = a teljes árverés vége = utolsó szakasz vége
+            # (az API-tól kapott érték már ezt jelenti, de felülírjuk a kiszámított értékkel)
+            data["arveres_vege"] = phase_ends[-1]
+        else:
+            data["phase_end_dates"] = []
+
+        log.info(
+            "Feldolgozva: %s | %s | hányad=%s | ár=%s | telek=%s | épület=%s | licit_sz=%s",
+            auction_id, data.get("cim", "N/A"), data.get("tulajdoni_hanyad"),
+            data.get("price"), data.get("telek_meret"), data.get("epulet_meret"),
+            data.get("licitek_szama"),
         )
 
-        data = extract(detail_data)
+        # Aktuális szakasz meghatározása
+        current_szakasz = get_current_stage(data.get("phase_end_dates") or [])
 
-        # Szűrő
-        if not passes_filters(data):
-            continue
-        
-        # Értesítési logika
-        if record is None:
-            send_telegram(data, indok="új")
-            db.execute("INSERT INTO properties (auction_id, created_at, notified_at, price) VALUES (?, ?, ?, ?)",
-                       (str(auction_id), datetime.now().isoformat(), datetime.now().isoformat(), data["price"]))
+        # Korábbi adatok lekérése
+        existing = conn.execute(
+            "SELECT price, licit_szam, arveres_vege, current_szakasz FROM properties WHERE auction_id = ?",
+            (auction_id,)
+        ).fetchone()
+
+        current_price  = data.get("price")
+        current_licits = data.get("licitek_szama", 0)
+        current_vege   = data.get("arveres_vege", "")
+
+        is_new = existing is None
+
+        indok: Optional[str] = None
+
+        if is_new:
+            if current_licits > 0:
+                indok = "új licit"
+            else:
+                indok = "új"
+            conn.execute(
+                """INSERT INTO properties (auction_id, created_at, price, licit_szam, arveres_vege, current_szakasz)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (auction_id, datetime.now().isoformat(),
+                 current_price, current_licits, current_vege, current_szakasz)
+            )
         else:
-            old_price = record[0]
-            if data["price"] and data["price"] != old_price:
-                indok = "új licit" if data["price"] > old_price else "árcsökkenés"
-                send_telegram(data, indok=indok)
-                db.execute("UPDATE properties SET price = ?, notified_at = ? WHERE auction_id = ?",
-                           (data["price"], datetime.now().isoformat(), str(auction_id)))
+            prev_price, prev_licits, prev_vege, prev_szakasz = existing
+
+            price_decreased   = prev_price   is not None and current_price  is not None and current_price  < prev_price
+            licit_increased   = prev_licits  is not None and current_licits is not None and current_licits > prev_licits
+            szakasz_increased = prev_szakasz is not None and current_szakasz > prev_szakasz
+
+            prev_dt = _parse_dt(prev_vege) if prev_vege and prev_vege != "N/A" else None
+            curr_dt = _parse_dt(current_vege) if current_vege and current_vege != "N/A" else None
+            date_moved_closer = prev_dt and curr_dt and curr_dt < prev_dt
+
+            if price_decreased:
+                indok = "árcsökkenés"
+            elif szakasz_increased:
+                indok = "szakaszváltás"
+            elif licit_increased and date_moved_closer:
+                indok = "új licit"
+            elif date_moved_closer:
+                indok = "új dátum"
+            elif licit_increased:
+                indok = "új licit"
+
+            if price_decreased or licit_increased or date_moved_closer or szakasz_increased:
+                conn.execute(
+                    """UPDATE properties
+                       SET price = ?, licit_szam = ?, arveres_vege = ?, current_szakasz = ?
+                       WHERE auction_id = ?""",
+                    (current_price, current_licits, current_vege, current_szakasz, auction_id)
+                )
+
+        if passes_filters(data) and indok:
+            log.info("✅ Értesítés küldése: %s (indok=%s)", auction_id, indok)
+            send_telegram(data, indok=indok)
+            conn.execute(
+                "UPDATE properties SET notified_at = ? WHERE auction_id = ?",
+                (datetime.now().isoformat(), auction_id)
+            )
+            notified_count += 1
+            if is_new:
+                new_count += 1
+        elif passes_filters(data):
+            log.info("⚠️ Nincs változás, nem küldünk értesítést: %s", auction_id)
+        else:
+            log.info("❌ Nem ment át (szűrő): %s", auction_id)
+
+        time.sleep(1)
+
+    log.info("Kész – Új: %d / Értesítés: %d", new_count, notified_count)
+    conn.close()
 
 if __name__ == "__main__":
-    main()
+    run()
