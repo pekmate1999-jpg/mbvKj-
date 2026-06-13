@@ -698,7 +698,7 @@ def extract(data: Dict) -> Dict:
         licit_szam = 0
 
     leiras_full = g("description", "leiras", "propertyDescription") or ""
-    leiras = leiras_full[:200].rstrip() if leiras_full else ""
+    leiras = leiras_full[:1000].rstrip() if leiras_full else ""  # ← 200 → 1000 karakter
 
     # Lakottság és ártípus detektálása a leírás alapján (price kiszámítása előtt!)
     leiras_full_lower = leiras_full.lower()
