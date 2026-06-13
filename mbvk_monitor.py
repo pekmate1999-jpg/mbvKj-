@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v7.3.1 – Beköltözhető ingatlanok (moveln=true)
-JAVÍTOTT: Ft/m² szűrés, vezetékjog nagyobb kontextusa, kibővített terület-kulcsszavak
+MBVK Árverési Monitor v7.3.2 – Beköltözhető ingatlanok (moveln=true)
+VÉGSŐ JAVÍTÁS: Ft/m² szűrés, vezetékjog szűrés, REGEX terület-variációk
 Kategorizált Telegram üzenet formátummal.
 """
 
@@ -184,13 +184,13 @@ def generate_gcal_url(title: str, date_str: str, location: str = "", details: st
         return None
 
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
-# JAVÍTOTT v7.3: Ft/m² szűrése, vezetékjog nagyobb kontextusa, kibővített kulcsszavak
+# VÉGSŐ JAVÍTOTT v7.3.2: Ft/m², vezetékjog, REGEX-alapú terület variációk (terülten, területe, stb.)
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    JAVÍTÁSOK:
+    VÉGSŐ JAVÍTÁSOK:
     1. Ft/m² szűrése (ár per négyzetméter, nem terület)
     2. Vezetékjog és hasonló jogi jogok szűrése (nagyobb kontextus: 100+ kar)
-    3. Több terület-kulcsszó támogatása (Területe, Terület, etc.)
+    3. Terület szó ÖSSZES VARIÁCIÓJA REGEX-szel: terület, terülten, területe, területén, stb.
     4. Jobb kontextus-elemzés az épület vs telek megkülönböztetéshez
     """
     if not desc:
@@ -213,11 +213,21 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
     telek_matches = []
     epulet_candidates = []
     
-    # KIBŐVÍTETT Telek kulcsszavak
-    telek_kws = [
-        "telek", "udvar", "ingatlan", "terület", "területe",
-        "tulajdonból", "földterület", "üres terület"
+    # ===== KIBŐVÍTETT Telek kulcsszavak (REGEX alapú!) =====
+    # Magyar nyelvtan: terület → terület, területe, terülten, területen, térületre, stb.
+    # Ezt már regex-szel kereshetjük meg helyesen!
+    telek_kws_patterns = [
+        r"telek",
+        r"udvar",
+        r"ingatlan",
+        r"terület|terülten|területen|területét|térületre|terüle",  # ← REGEX: terület összes formája!
+        r"tulajdonból",
+        r"földterület",
+        r"üres terület",
     ]
+    
+    # Kompilált regex a kereséshez
+    telek_pattern = re.compile("|".join(telek_kws_patterns), re.IGNORECASE)
     
     # Épület/lakás specifikus kulcsszavak (magasabb prioritás)
     epulet_prior_kws = [
@@ -288,10 +298,10 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
             epulet_candidates.append((val, best_epulet_dist))
             continue
         
-        # --- 3B: Ha nincs épület kulcsszó, akkor telek-e? ---
-        # Telek kulcsszavak keresése nagyobb ablakban
-        is_telek = any(kw in context for kw in telek_kws)
-        if is_telek:
+        # --- 3B: Ha nincs épület kulcsszó, akkor telek-e? (REGEX alapú!) ---
+        # Telek kulcsszavak keresése regex-szel az összes variációhoz
+        telek_match = telek_pattern.search(context)
+        if telek_match:
             telek_matches.append(val)
         else:
             # Sem épület, sem explicit telek kulcsszó nélkül:
@@ -982,7 +992,7 @@ def send_telegram(data: Dict, indok: str = "új"):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor v7.3.1 indítás – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor v7.3.2 indítás – %s", datetime.now().isoformat())
     if not GEOPY_OK:
         log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
