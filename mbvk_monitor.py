@@ -184,8 +184,6 @@ def generate_gcal_url(title: str, date_str: str, location: str = "", details: st
         return None
 
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
-# parse_sizes_from_description függvény módosítása
-
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
     if not desc:
         return None, None
@@ -818,7 +816,7 @@ def send_telegram(data: Dict, indok: str = "új"):
     end_str    = fmt_date(end)
     dist_str   = f"{dist_km:.0f} km"                   if dist_km is not None else None
 
-    # Google Calendar link generálása az árverés végéhez
+    # Google Calendar link generálása az árverés végéhez (kattintható dátum)
     end_gcal_url = None
     if end_str:
         end_gcal_url = generate_gcal_url(
@@ -921,7 +919,7 @@ def send_telegram(data: Dict, indok: str = "új"):
                 "chat_id":                  TELEGRAM_CHAT_ID,
                 "text":                     text,
                 "parse_mode":               "Markdown",
-                "disable_web_page_preview": False,
+                "disable_web_page_preview": True,   # Link előnézet kikapcsolva (nincs Google Workspace felirat)
             },
             timeout=15,
         )
