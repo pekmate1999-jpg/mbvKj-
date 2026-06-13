@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MBVK Árverési Monitor v7.2.1 – Beköltözhető ingatlanok (moveln=true)
-Vármegye, javított szakaszok, négyzetzméter javitások, vezetékjog, telekméret hibák további javítása
+MBVK Árverési Monitor v7.3.1 – Beköltözhető ingatlanok (moveln=true)
+JAVÍTOTT: Ft/m² szűrés, vezetékjog nagyobb kontextusa, kibővített terület-kulcsszavak
 Kategorizált Telegram üzenet formátummal.
 """
 
@@ -184,11 +184,27 @@ def generate_gcal_url(title: str, date_str: str, location: str = "", details: st
         return None
 
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
+# JAVÍTOTT v7.3: Ft/m² szűrése, vezetékjog nagyobb kontextusa, kibővített kulcsszavak
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    JAVÍTÁSOK:
+    1. Ft/m² szűrése (ár per négyzetméter, nem terület)
+    2. Vezetékjog és hasonló jogi jogok szűrése (nagyobb kontextus: 100+ kar)
+    3. Több terület-kulcsszó támogatása (Területe, Terület, etc.)
+    4. Jobb kontextus-elemzés az épület vs telek megkülönböztetéshez
+    """
     if not desc:
         return None, None
 
     desc_lower = desc.lower()
+    
+    # PATTERN 1: Ft/m² vagy hasonló ARA szűréshez (ez nem terület!)
+    price_per_m2_pattern = re.compile(
+        r"(?:ft|ft\.)\s*(?:/|per)?\s*m[²2]|ft/m[²2]",
+        re.IGNORECASE
+    )
+    
+    # PATTERN 2: Terület mérések (m², m2, nm, négyzetméter)
     pattern = re.compile(
         r"(\d+(?:[.,]\d+)?)\s*(?:m[²2]|nm|négyzetméter)",
         re.IGNORECASE
@@ -197,17 +213,33 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
     telek_matches = []
     epulet_candidates = []
     
-    # Telek kulcsszavak: "telek", "udvar", "ingatlan" (a "terület" túl általános, elhagyjuk)
-    telek_kws = ["telek", "udvar", "ingatlan"]
-    
-    epulet_prior_kws = [
-        "lakóház", "lakás", "épület", "hasznos alapterület",
-        "alapterület", "alapterülete"
+    # KIBŐVÍTETT Telek kulcsszavak
+    telek_kws = [
+        "telek", "udvar", "ingatlan", "terület", "területe",
+        "tulajdonból", "földterület", "üres terület"
     ]
     
+    # Épület/lakás specifikus kulcsszavak (magasabb prioritás)
+    epulet_prior_kws = [
+        "lakóház", "lakás", "épület", "épületre",
+        "hasznos alapterület", "hasznos alapterülete",
+        "alapterület", "alapterülete",
+        "lakóterület", "lakóépület",
+        "házrész", "lakóegység"
+    ]
+    
+    # KIBŐVÍTETT BLACKLIST: vezetékjog, szolgalmi jog, stb.
+    # (nem terület, hanem jogi jog vagy egyéb nem-terület jellegű adat)
     area_blacklist = [
-        "vezetékjog", "szolgalmi jog", "terhel", "terheli",
-        "bejegyzett", "engedélyszám", "javára", "vázrajz",
+        "vezetékjog", "vezeték jog",
+        "szolgalmi jog", "közművezetékjog",
+        "terhelés alá esik", "terhelés", "terhel", "terheli",
+        "bejegyzett",
+        "engedélyszám",
+        "javára",
+        "vázrajz", "vázrajza",
+        "ű.sz", "helyrajzi szám", "helyrajz", "kataszteri",
+        "üzemegység", "közös tulajdon", "közös épületrész",
     ]
     
     for match in pattern.finditer(desc_lower):
@@ -221,42 +253,59 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
         start = match.start()
         end = match.end()
         
-        # Feketelista ellenőrzés (szűk ablak)
-        bl_start = max(0, start - 40)
-        bl_end   = min(len(desc_lower), end + 40)
+        # ===== 1. SZŰRÉS: Ft/m² (ár, nem terület) =====
+        # Ellenőrizzük, hogy ezt megelőzi-e "Ft" vagy hasonló
+        before_str = desc_lower[max(0, start - 30):start].lower()
+        if re.search(r"ft\.?\s*(?:/|per)?$", before_str):
+            # Ez egy ár (Ft/m²), nem egy terület!
+            continue
+        
+        # ===== 2. SZŰRÉS: Vezetékjog és jogi jog (nagyobb kontextus) =====
+        # Kontextus 100 karakterre növelve (volt 40)
+        bl_start = max(0, start - 100)
+        bl_end   = min(len(desc_lower), end + 100)
         bl_ctx   = desc_lower[bl_start:bl_end]
         if any(kw in bl_ctx for kw in area_blacklist):
             continue
         
-        # Tágabb kontextus (kulcsszavak kereséséhez)
-        ctx_start = max(0, start - 80)
-        ctx_end   = min(len(desc_lower), end + 80)
+        # ===== 3. KONTEXTUS: Kulcsszavak keresése (nagyobb ablak) =====
+        ctx_start = max(0, start - 150)
+        ctx_end   = min(len(desc_lower), end + 150)
         context   = desc_lower[ctx_start:ctx_end]
         
-        # --- Először épület kulcsszavak keresése ---
-        best_dist = None
+        # --- 3A: Először épület kulcsszavak keresése (magasabb prioritás) ---
+        best_epulet_dist = None
         for kw in epulet_prior_kws:
             kw_pos = context.find(kw)
             if kw_pos != -1:
                 abs_kw_pos = ctx_start + kw_pos
                 dist = abs(abs_kw_pos - start)
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
+                if best_epulet_dist is None or dist < best_epulet_dist:
+                    best_epulet_dist = dist
         
-        # Ha találtunk épület kulcsszót, akkor ez épület méret, és nem telek
-        if best_dist is not None:
-            epulet_candidates.append((val, best_dist))
-            continue   # <- fontos: nem megyünk tovább a telek ellenőrzésre
+        # Ha találtunk épület kulcsszót, akkor ez épület méret
+        if best_epulet_dist is not None:
+            epulet_candidates.append((val, best_epulet_dist))
+            continue
         
-        # --- Ha nincs épület kulcsszó, akkor telek-e? ---
+        # --- 3B: Ha nincs épület kulcsszó, akkor telek-e? ---
+        # Telek kulcsszavak keresése nagyobb ablakban
         is_telek = any(kw in context for kw in telek_kws)
         if is_telek:
             telek_matches.append(val)
+        else:
+            # Sem épület, sem explicit telek kulcsszó nélkül:
+            # Ha van önálló "m²" szám, az általában a telek mérete
+            # (mert az épület mérete általában fel van tüntetve explicit névvel)
+            if re.match(r"^\d+(?:[.,]\d+)?\s*m[²2]", desc_lower[max(0, start-5):end+5]):
+                telek_matches.append(val)
     
+    # ===== VÉGEREDMÉNY ÖSSZEÁLLÍTÁSA =====
     telek = max(telek_matches) if telek_matches else None
     
     epulet = None
     if epulet_candidates:
+        # Legközelebb lévő épület kulcsszó, lehetőleg nagyobb érték
         epulet_candidates.sort(key=lambda x: (x[1], -x[0]))
         epulet = epulet_candidates[0][0]
     
@@ -933,7 +982,7 @@ def send_telegram(data: Dict, indok: str = "új"):
 # ── Főprogram ─────────────────────────────────────────────────────────────────
 def run():
     load_telepules_map()
-    log.info("MBVK Monitor v7.3 indítás – %s", datetime.now().isoformat())
+    log.info("MBVK Monitor v7.3.1 indítás – %s", datetime.now().isoformat())
     if not GEOPY_OK:
         log.warning("geopy nincs telepítve – Budapest-távolság nem elérhető.")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
