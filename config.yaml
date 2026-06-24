@@ -21,10 +21,10 @@ distance_score:
   enabled: true
   weight: 30                    # relatív súly (többi kritériumhoz képest)
   thresholds:                   # km – pont (interpolálva közte)
-    - { max_km:  30, points: 5 }
-    - { max_km:  60, points: 4 }
-    - { max_km: 100, points: 3 }
-    - { max_km: 150, points: 2 }
+    - { max_km:  50, points: 5 }
+    - { max_km: 100, points: 4 }
+    - { max_km: 150, points: 3 }
+    - { max_km: 250, points: 2 }
     - { max_km: 9999, points: 1 }
 
 # ── Telekméret pontozás ─────────────────────────────────────────────
@@ -33,11 +33,11 @@ land_size_score:
   enabled: true
   weight: 25                    # relatív súly
   thresholds:                   # m² – pont
-    - { min_m2:    0, points: 1 }
-    - { min_m2:  300, points: 2 }
-    - { min_m2:  600, points: 3 }
-    - { min_m2: 1000, points: 4 }
-    - { min_m2: 2000, points: 5 }
+    - { min_m2:  500, points: 1 }
+    - { min_m2: 1000, points: 2 }
+    - { min_m2: 2000, points: 3 }
+    - { min_m2: 4000, points: 4 }
+    - { min_m2: 6000, points: 5 }
 
 # ── Ft/m² ár pontozás ──────────────────────────────────────────────
 # Alacsonyabb Ft/m² = jobb vétel = magasabb pont.
@@ -46,10 +46,10 @@ price_per_m2_score:
   enabled: true
   weight: 35                    # relatív súly (ez a legfontosabb)
   thresholds:                   # Ft/m² felső határ – pont (minél kisebb az ár, annál jobb)
-    - { max_ft_per_m2:    500, points: 5 }
-    - { max_ft_per_m2:   1500, points: 4 }
-    - { max_ft_per_m2:   3000, points: 3 }
-    - { max_ft_per_m2:   6000, points: 2 }
+    - { max_ft_per_m2:    100, points: 5 }
+    - { max_ft_per_m2:    200, points: 4 }
+    - { max_ft_per_m2:    300, points: 3 }
+    - { max_ft_per_m2:    500, points: 2 }
     - { max_ft_per_m2: 999999, points: 1 }
 
 # ── Megye pontozás ─────────────────────────────────────────────────
@@ -61,13 +61,14 @@ county_score:
   scores:
     - { county: "Pest",                    points: 5 }
     - { county: "Budapest",                points: 5 }
-    - { county: "Fejér",                   points: 4 }
+    - { county: "Zala",                    points: 5 }
     - { county: "Komárom-Esztergom",       points: 4 }
-    - { county: "Győr-Moson-Sopron",       points: 3 }
-    - { county: "Veszprém",                points: 3 }
-    - { county: "Nógrád",                  points: 2 }
-    - { county: "Heves",                   points: 2 }
-    - { county: "Bács-Kiskun",             points: 2 }
-    - { county: "Somogy",                  points: 1 }
-    - { county: "Baranya",                 points: 1 }
+    - { county: "Fejér",                   points: 4 }
+    - { county: "Veszprém",                points: 4 }
+    - { county: "Somogy",                  points: 4 }
+    - { county: "Nógrád",                  points: 4 }
+    - { county: "Tolna",                   points: 3 }
+    - { county: "Bács-Kiskun",             points: 3 }
+    - { county: "Jász-Nagykun-Szolnok",    points: 3 }
+    - { county: "Heves",                   points: 3 }
   default_points: 1             # ha a megye nincs a listában
