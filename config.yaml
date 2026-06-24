@@ -6,14 +6,39 @@
 #      a program normalizálja automatikusan.
 #    - A pontszám 1–5 skálán jelenik meg a Telegram üzenetben.
 #    - Csak azok az ingatlanok kapnak értesítést, amelyek elérik
-#      a min_score küszöbértéket.
+#      a min_score küszöbértéket – KIVÉVE a vip_override szabályokat.
 # ═══════════════════════════════════════════════════════════════════
 
 # ── Általános szűrők ────────────────────────────────────────────────
 filters:
   max_price: 5_000_000          # Ft – ennél drágább ingatlan kiszűrve
-  min_score: 3.0                # 1–5 skálán, ez alatti score nem kap értesítést
+  min_score: 3.5                # 1–5 skálán, ez alatti score nem kap értesítést
+                                # (3.0-ról 4.0-ra emelve a ritkább értesítéshez)
   only_movein_ready: true       # csak beköltözhető (moveln=true) ingatlanok
+
+# ── VIP gyorssáv ────────────────────────────────────────────────────
+# Ha bármelyik szabály teljesül, az ingatlan értesítést kap,
+# még akkor is, ha a score nem éri el a min_score küszöböt.
+# Ezzel a valódi kincsek sosem szöknek meg.
+vip_override:
+  enabled: true
+  rules:
+    # 1. Extrém olcsó Ft/m² – ez mindig kincs, bárhol legyen
+    - name: "Ultra-olcsó Ft/m²"
+      condition:
+        price_per_m2_max_ft: 100
+
+    # 2. Elfogadható ár + nagy telek kombó
+    - name: "Nagy telek + jó ár"
+      condition:
+        price_per_m2_max_ft: 500
+        land_size_min_m2: 3000
+
+    # 3. Zala vagy Pest megye, 2 millió Ft alatt – bármilyen méret
+    - name: "Zala/Pest kedvenc megyék – olcsón"
+      condition:
+        counties: ["Zala", "Pest"]
+        max_price_ft: 2_000_000
 
 # ── Budapest-távolság pontozás ──────────────────────────────────────
 # Minél közelebb van Budapesthez, annál magasabb pontot kap.
