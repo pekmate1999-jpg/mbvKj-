@@ -21,7 +21,7 @@ from typing import Optional, List, Dict, Tuple
 from urllib.parse import quote_plus
 
 import requests
-import yaml
+
 
 # geopy opcionális
 try:
