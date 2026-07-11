@@ -208,28 +208,32 @@ def generate_gcal_url(title: str, date_str: str, location: str = "", details: st
 # ── Telek- és épületméret kinyerése a leírásból ───────────────────────────────
 def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    v8 JAVÍTÁS: Szóközzel tagolt számok (pl. "2 971 m2") helyes felismerése.
-    A regex most \d+(?:\s\d{3})* mintát is kezel.
+    v8.1 JAVÍTÁS:
+      - "beépítetlen terület" explicit telek-jelző (felülírja az 'alapterület' épület-találatot)
+      - blacklist csak a szám ELŐTTI szűk kontextusban (60 kar) számít,
+        így a mondat végi 'vezetékjoga' nem szűri ki a mondat eleji telekméretet
     """
     if not desc:
         return None, None
 
     desc_lower = desc.lower()
 
-    # v8: szóközzel tagolt ezres is felismerhető: "2 971 m²"
     pattern = re.compile(
         r"(\d+(?:\s\d{3})*(?:[.,]\d+)?)\s*(?:m[²2]|nm|négyzetméter)",
         re.IGNORECASE
     )
 
+    # Erős telek-jelzők: ha ezek a szám közelében vannak, telek (akkor is, ha 'alapterület' szerepel)
+    strong_telek_kws = [
+        "beépítetlen terület", "beepitetlen terulet",
+        "beépítetlen terület", "kivett beépítetlen",
+        "üres terület", "üres telek", "beépítetlen ingatlan",
+    ]
+
     telek_kws_patterns = [
-        r"telek",
-        r"udvar",
-        r"ingatlan",
+        r"beépítetlen", r"telek", r"udvar", r"ingatlan",
         r"terület|terülten|területen|területét|térületre|terüle",
-        r"tulajdonból",
-        r"földterület",
-        r"üres terület",
+        r"tulajdonból", r"földterület", r"üres terület",
     ]
     telek_pattern = re.compile("|".join(telek_kws_patterns), re.IGNORECASE)
 
@@ -271,8 +275,16 @@ def parse_sizes_from_description(desc: str) -> Tuple[Optional[float], Optional[f
         if re.search(r"ft\.?\s*(?:/|per)?$", before_str):
             continue
 
-        bl_ctx = desc_lower[max(0, start - 100):min(len(desc_lower), end + 100)]
-        if any(kw in bl_ctx for kw in area_blacklist):
+        # v8.1: blacklist CSAK a szám előtti szűk (60 kar) sávban blokkol,
+        # így a mondat végi 'vezetékjoga' nem öli meg a mondat eleji méretet
+        bl_ctx_before = desc_lower[max(0, start - 60):start]
+        if any(kw in bl_ctx_before for kw in area_blacklist):
+            continue
+
+        # v8.1: erős telek-jelző a szám ±40 karakteres közelében -> azonnal telek
+        strong_ctx = desc_lower[max(0, start - 40):min(len(desc_lower), end + 40)]
+        if any(kw in strong_ctx for kw in strong_telek_kws):
+            telek_matches.append(val)
             continue
 
         ctx_start = max(0, start - 150)
